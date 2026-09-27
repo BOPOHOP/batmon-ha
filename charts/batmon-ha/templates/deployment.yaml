@@ -78,7 +78,7 @@ spec:
             # rejects the nesting, swap this for an initContainer that copies the
             # ConfigMap into the volume.
             - name: config
-              mountPath: /data/options.json
+              mountPath: data/options.json
               subPath: options.json
               readOnly: true
             {{- with .Values.extraVolumeMounts }}

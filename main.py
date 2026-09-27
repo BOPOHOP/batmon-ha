@@ -20,7 +20,7 @@ def _early_select_ble_stack():
     """
     import json
     opt = None
-    for path in ('/data/options.json', 'options.json'):
+    for path in ('options.json'): #, '/data/options.json', 'options.json'):
         try:
             with open(path) as f:
                 opt = json.load(f)

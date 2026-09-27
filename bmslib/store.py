@@ -15,7 +15,7 @@ def is_readable(file):
     return isfile(file) and access(file, R_OK)
 
 
-root_dir = '/data/' if is_readable('/data/options.json') else ''
+root_dir = 'data/' if is_readable('data/options.json') else ''
 bms_meter_states_fn = root_dir + 'bms_meter_states.json'
 
 lock = Lock()
@@ -61,11 +61,11 @@ def store_algorithm_state(bms_name, algorithm_name, state=None):
 
 def load_user_config():
     try:
-        with open('/data/options.json') as f:
+        with open('data/options.json') as f:
             conf = dotdict(json.load(f))
             _user_config_migrate_addresses(conf)
     except Exception as e:
-        logger.warning('error reading /data/options.json, trying options.json %s', e)
+        logger.warning('error reading data/options.json, trying options.json %s', e)
         with open('options.json') as f:
             conf = dotdict(json.load(f))
     return conf

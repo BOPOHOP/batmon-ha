@@ -33,7 +33,7 @@ _has_bashio() { command -v bashio::config >/dev/null 2>&1; }
 _cfg_json() {
   "$_CFG_PY" -c '
 import json, sys
-for path in ("/data/options.json", "options.json"):
+for path in ("data/options.json", "options.json"):
     try:
         value = json.load(open(path)).get(sys.argv[1])
     except Exception:

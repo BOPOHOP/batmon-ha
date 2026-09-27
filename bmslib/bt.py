@@ -39,7 +39,7 @@ except ImportError:
 
 
 @backoff.on_exception(backoff.expo, Exception, max_time=10, logger=get_logger())
-async def bt_discovery(logger, timeout: int = 5, adapter=None):
+async def bt_discovery(logger, timeout: int = 15, adapter=None):
     ad = adapter or 'default'
     logger.info('BT Discovery (%d seconds, adapter=%s):', timeout, adapter or 'default')
     scanner = BleakScanner(adapter=adapter) if adapter else BleakScanner()

@@ -18,3 +18,4 @@ pyserial
 # see https://github.com/fl4p/batmon-ha/issues/147 (rpi 3)
 
 # aiobmsble  # see Dockerfile
+aiobmsble
