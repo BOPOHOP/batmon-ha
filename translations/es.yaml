@@ -94,6 +94,14 @@ configuration:
       Apagar y volver a encender el adaptador Bluetooth una vez al
       arrancar el complemento. A veces resuelve estados bloqueados del
       adaptador del host.
+  bt_power_cycle_on_error:
+    name: Apagar/encender Bluetooth ante errores repetidos
+    description: >-
+      Último recurso: si la reconexión de un BMS falla de forma persistente,
+      apagar y volver a encender el adaptador Bluetooth. Ayuda cuando la pila
+      del host está bloqueada ("Operation already in progress"), pero corta
+      brevemente todas las conexiones Bluetooth, incluidas las que funcionan y
+      las de Home Assistant. Desactivado por defecto.
 
   ble_stack:
     name: Stack Bluetooth
@@ -176,3 +184,31 @@ configuration:
       algoritmos de estado de salud (SoH) y resistencia de celda. Los
       identificadores son aleatorios o con hash; sin dirección MAC, sin
       ubicación, sin datos personales.
+  impedance_estimator:
+    name: Estimar la resistencia de celda (experimental)
+    description: >-
+      Estima la resistencia interna por celda de baterías LiFePO4 a partir de
+      la corriente y las tensiones de celda, como sensor "Cell Resistance" en
+      mOhm. Necesita saltos de corriente grandes (8 A o más), por lo que una
+      batería pequeña puede no obtener nunca un valor. Se desactiva sola en
+      baterías que no son LiFePO4.
+  pack_temp_estimator:
+    name: Estimar la temperatura de la batería (experimental)
+    description: >-
+      Estima la temperatura de las celdas a partir de la temperatura del
+      MOSFET del BMS y, si están configuradas, de las temperaturas interior y
+      exterior, como sensor "Pack Temp (RC est.)". Para BMS que solo informan
+      la temperatura del MOSFET, que se dispara bajo carga.
+  pack_temp_room_topic:
+    name: Temperatura de batería, topic interior
+    description: >-
+      Topic MQTT con una temperatura interior en °C, p. ej. publicada por
+      mqtt_statestream de Home Assistant. Opcional.
+  pack_temp_outdoor_topic:
+    name: Temperatura de batería, topic exterior
+    description: Topic MQTT con una temperatura exterior en °C. Opcional.
+  pack_temp_ambient_max_age:
+    name: Temperatura de batería, antigüedad máx. del ambiente (s)
+    description: >-
+      Una lectura ambiente más antigua cuenta como ausente. Por defecto 600.
+      Elija un valor mayor que el intervalo de envío de sus sensores.

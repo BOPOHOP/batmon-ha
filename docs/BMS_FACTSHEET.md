@@ -439,11 +439,21 @@ These plugins follow the same wrap-loss pattern as the top-tier set: every key i
 
 **Fields decoded by aiobmsble (forwarded by wrap).** `voltage` (`Batt[0][0]/1000`), `current` (`Batt[1][0]/10`, sign-flipped on the way into `BmsSample`), `soc` ← `BatsocList[0][0]/100`, `charge` ← `cycle_charge` derived as `SoC × capacity / 1e7`, `temperatures[0]` (first entry of `BtemList/10`), per-cell mV (`BatcelList[0]`).
 
+**`SolarB_*` firmware (2026).** A vendor firmware update (FLB48314TG1 and siblings, OUI `A4:05:FD`) renames the advertisement from `F07…`/`F10…` to `SolarB_<4 hex>_<serial>` and makes the pack require a BLE **bond**: an unbonded central gets `Insufficient authentication` on the first ATT op, or is dropped while BlueZ is still resolving services (`failed to discover services, device disconnected`). The upstream matcher no longer catches these names, so the HA integration cannot even offer them; in batmon the type is forced by config, and the bond comes from `pin:` (reported PIN `123456`) — see #415, upstream #735 / #801. `ble_stack: esphome` has no agent to answer a PIN prompt, so these need a local adapter.
+
+**Confirmed on hardware (2026-09-22, #415).** Three FLB48314TG1-H (51.2 V, 314 Ah nominal, ~350 Ah reported) on
+`hci0`/bluez-5.86: the JSON protocol is unchanged by the rename, so `type: felicity` decodes the renamed packs as-is
+(83 % SoC, 54.2 V, ~100 A each, cells within 20 mV). The bond is necessary but not sufficient: a pack that was already
+bonded still failed at service discovery until HA's Bluetooth integration was disabled (adapter scan contention), with
+`keep_alive: true` and `sample_period: 10`. `mos_temperature` is NaN — the Felicity JSON carries no MOSFET probe.
+
 **Decoded by plugin but DROPPED by wrap.** `problem_code` (combined `Bwarn + Bfault` — full alarm surface lost), `temp_values[1..N]` (Felicity racks typically report 4 probes). Felicity does **not** emit `battery_health`, `cycles`, `design_capacity`, `balancer`, `chrg_mosfet`, `dischrg_mosfet`, `runtime`, or `pack_*` arrays — so `soh` / `num_cycles` / `capacity` will be NaN unless user-configured.
 
 **Links.**
 - [aiobmsble — felicity_bms.py](https://github.com/patman15/aiobmsble/blob/main/aiobmsble/bms/felicity_bms.py)
 - [patman15/BMS_BLE-HA #161 — Felicity Solar LUX-Y-48300LG01](https://github.com/patman15/BMS_BLE-HA/issues/161) — RE seed
+- [patman15/BMS_BLE-HA #735 — FLB48314TG1 bluetooth authentication](https://github.com/patman15/BMS_BLE-HA/issues/735) — the bonding requirement, PIN `123456`
+- [patman15/BMS_BLE-HA #801 — Problem with Felicity batteries after Firmware Upgrade](https://github.com/patman15/BMS_BLE-HA/issues/801) — the `F07…` → `SolarB_…` rename
 - [SirkoVZ/BMS_BLE-HA_felicity](https://github.com/SirkoVZ/BMS_BLE-HA_felicity) — Felicity-only fork that the upstream plugin grew out of
 - [Felicity LPBF12300 BMS manual (PDF)](https://www.felicitysolar.com/wp-content/uploads/2025/05/358-010412-00-LPBF12300.pdf)
 - [Felicity LUX-Y product page](https://us.felicitysolar.com/lux-y-series/)
@@ -936,7 +946,7 @@ No CRC validation (the ATORCH `XOR-with-0x44` checksum is skipped). Min frame 28
 The remaining aiobmsble plugins cover the BMSes below (paths under `aiobmsble/bms/`). Use `<name>_aiobmsble` or `<name>_ble` as the batmon device `type`. Most follow the patman15 conventions documented above; ping me if you want a deep-dive sheet on any of these.
 
 Off-brand LFP packs / rack BMSes:
-`ag_bms`, `braunpwr_bms`, `buknuwo_bms`, `dpwrcore_bms`, `ej_bms`, `eleksol_bms`, `humsienk_bms`, `lipower_bms`, `myvolta_bms`, `pro_bms`, `saihang_bms`, `ws_nova_bms`, `dummy_bms`.
+`ag_bms`, `braunpwr_bms`, `buknuwo_bms`, `dpwrcore_bms`, `ej_bms`, `eleksol_bms`, `humsienk_bms`, `lipower_bms`, `myvolta_bms`, `pro_bms`, `pwrboozt_bms`, `saihang_bms`, `ws_nova_bms`, `dummy_bms`.
 
 For any of these, the canonical references are:
 - aiobmsble plugin source: `https://github.com/patman15/aiobmsble/blob/main/aiobmsble/bms/<name>_bms.py`
@@ -946,20 +956,52 @@ For any of these, the canonical references are:
 
 ---
 
+## BM6 / BM2 car battery monitors — `models/bm6.py`
+
+**Vendor / variants.** 12 V lead-acid "battery health" dongles clamped to the car battery, sold under many names. `bm6`: BM6 (Leagend/Quicklynks, also Sealey BT2020). `bm2`: Quicklynks BM2, Ancel BM200 and other rebrands using the reskinned BM2 app. Not a BMS: no cells, no current sensor, no switches.
+
+**Transport.** BLE GATT service `0xfff0`, write on `0xfff3`, notify on `0xfff4`. Every 16-byte frame in either direction is AES-128 with a fixed per-model key and a zero IV (one block, so effectively ECB). Batmon carries a tiny pure-Python AES for this; the keys are in the module (`BM6_KEY` = `leagend\xff\xfe0100009`, `BM2_KEY` = `leagend\xff\xfe1882466`).
+
+**Wire protocol.** BM6: request `d1 55 07 00…` encrypted, reply `d1 55 07 | sign | temp | state | soc | voltage*100 (u16) | …`. BM2: no request, the device pushes `f5 | voltage*100 (12 bit) | status (4 bit) | soc | …` about once a second.
+
+**Fields decoded by batmon.** `voltage`, `soc`; BM6 also `temperatures=[t]`, `battery_mode` (`ok` / `low_voltage` / `charging`), `battery_charging`, `problem` (low voltage). `current` is NaN, so no power and no Ah/kWh meters.
+
+**Known on the wire but NOT decoded by batmon.** BM6 rapid acceleration/deceleration counters, the firmware-version reply (`d1 55 01`), BM2 status nibble, BM2 history download (`e7 01`, cranking voltage log).
+
+**Caveats.** One BLE connection at a time; the phone app must be closed. Untested on hardware as of the port (#160, #41), the decoders are verified against captured frames from the write-ups only.
+
+**Links.**
+- [tarball.ca — Reverse engineering the BM6 BLE battery monitor](https://www.tarball.ca/posts/reverse-engineering-the-bm6-ble-battery-monitor/) — key, frames, known-answer pair
+- [Rafciq/BM6](https://github.com/Rafciq/BM6) — HA integration, state / SOC bytes
+- [JeffWDH/bm6-battery-monitor](https://github.com/JeffWDH/bm6-battery-monitor) — Python tool + ESPHome
+- [KrystianD/bm2-battery-monitor](https://github.com/KrystianD/bm2-battery-monitor) — BM2 key, client, history protocol
+- [doubleagent.net — BM2: reversing the BLE protocol](https://doubleagent.net/bm2-reversing-the-ble-protocol-of-the-bm2-battery-monitor/) — BM2 frame parsing (dealRealData)
+- No syssi component. Not in aiobmsble. Not in YamBMS.
+
+---
+
 ## Appendix: where each BMS lives in this repo
 
 ```
 bmslib/models/
-├── ant.py          ANT new-protocol (7E A1)
-├── daly.py         Daly legacy UART (a5 80 …)
-├── daly2.py        Daly Modbus (D2 03)
-├── jbd.py          JBD / Xiaoxiang / Overkill
-├── jikong.py       JK BMS (Jikong) — JK02_24S and JK02_32S
-├── litime.py       LiTime / Ampere Time
-├── sok.py          SOK / ABC-BMS
-├── supervolt.py    SuperVolt + SX150P variant
-├── victron.py      Victron SmartShunt GATT
-└── BLE_BMS_wrap.py wrapper for any aiobmsble plugin
+├── ant.py            ANT new-protocol (7E A1)
+├── basen.py          Basen BLE (0xFA00), ported from syssi/esphome-basen-bms
+├── basen_uart.py     Basen RS232/RS485
+├── bm6.py            BM6 and BM2/Ancel BM200 car battery monitors (AES, no current)
+├── daly.py           Daly legacy protocol over BLE (a5 80 …), incl. set SOC (0x21)
+├── daly_uart.py      Daly over RS485/UART, multi-board bus
+├── daly2.py          Daly Modbus BLE module (D2 03)
+├── jbd.py            JBD / Xiaoxiang / Overkill, balancing bitmask, pin pairing for new fw
+├── jikong.py         JK BMS (Jikong) — JK02_24S and JK02_32S, set SOC (0x6E) on 32S
+├── jikong_uart.py    JK over RS485/UART
+├── litime.py         LiTime / Ampere Time
+├── noname_modbus.py  generic Modbus-RTU-over-NUS Chinese BMS (#131)
+├── pace.py           PACE "paceic" RS232/RS485 (SOK, SunGoldPower, Sunsynk rebrands)
+├── snoop.py          GATT dumper / protocol prober for unknown BMS (doc/SNOOP.md)
+├── sok.py            SOK / ABC-BMS legacy firmware
+├── supervolt.py      SuperVolt + SX150P variant
+├── victron.py        Victron SmartShunt GATT
+└── BLE_BMS_wrap.py   wrapper for any aiobmsble plugin
 ```
 
 aiobmsble plugins ship as a separate PyPI package. The local `bmslib/bms_ble/plugins/` directory holds batmon-only plugins (currently `cw20_bms` for the CW20 power meter).

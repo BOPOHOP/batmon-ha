@@ -88,6 +88,13 @@ configuration:
     description: >-
       Toggle the Bluetooth adapter off/on once at addon startup. Sometimes
       clears stuck states on the host adapter.
+  bt_power_cycle_on_error:
+    name: Power-cycle Bluetooth on repeated errors
+    description: >-
+      Last resort: if reconnecting a BMS keeps failing, toggle the Bluetooth
+      adapter off/on. Helps when the host stack is wedged ("Operation already
+      in progress"), but it briefly drops all Bluetooth connections, including
+      healthy ones and Home Assistant's own. Off by default.
 
   ble_stack:
     name: Bluetooth stack
@@ -158,3 +165,30 @@ configuration:
       voltages) to the developer to help refine the state-of-health and cell
       resistance algorithms. Identifiers are random or hashed; no MAC address,
       no location, no personal data.
+  impedance_estimator:
+    name: Cell resistance estimator (experimental)
+    description: >-
+      Estimate the internal resistance per cell of LiFePO4 packs from the
+      sampled current and cell voltages, as a "Cell Resistance" sensor in
+      mOhm. Needs large current steps (8 A or more), so small packs may never
+      get a value. Turns itself off for packs that are not LiFePO4.
+  pack_temp_estimator:
+    name: Pack temperature estimator (experimental)
+    description: >-
+      Estimate the cell temperature from the BMS MOSFET temperature and, if
+      configured, room and outdoor temperatures, as a "Pack Temp (RC est.)"
+      sensor. For BMSes that only report a MOSFET temperature, which spikes
+      under load.
+  pack_temp_room_topic:
+    name: Pack temperature, room topic
+    description: >-
+      MQTT topic carrying a room (indoor) temperature in °C, e.g. published by
+      Home Assistant's mqtt_statestream. Optional.
+  pack_temp_outdoor_topic:
+    name: Pack temperature, outdoor topic
+    description: MQTT topic carrying an outdoor temperature in °C. Optional.
+  pack_temp_ambient_max_age:
+    name: Pack temperature, max ambient age (s)
+    description: >-
+      An ambient reading older than this counts as missing. Default 600. Set
+      it above the update interval of your temperature sensors.

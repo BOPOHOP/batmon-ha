@@ -1,18 +1,23 @@
 import asyncio
-import math
-import statistics
 from copy import copy
-from typing import Dict, Iterable, List
+from typing import Dict, List
 
 from bmslib.bms import BmsSample
-from bmslib.bt import BtBms
+from bmslib.bt import BtBms, normalize_ble_address
 from bmslib.util import get_logger
+from bmslib.wire.aggregate import (  # noqa: F401
+    is_finite,
+    finite_or_fallback,
+    sum_parallel,
+    sum_series,
+)
 
 
 class BmsGroup:
 
-    def __init__(self, name):
+    def __init__(self, name, kind='parallel'):
         self.name = name
+        self.kind = kind
         self.bms_names = list()
         self.samples: Dict[str, BmsSample] = {}
         self.voltages: Dict[str, List[int]] = {}
@@ -29,13 +34,36 @@ class BmsGroup:
     def fetch(self) -> BmsSample:
         # ts_expire = time.time() - self.max_sample_age
         # expired = set(k for k,s in self.samples.items() if s.timestamp < ts_expire)
-        return sum_parallel(self.samples.values())
+        if set(self.samples) != set(self.bms_names) or not self.samples:
+            missing = set(self.bms_names) - set(self.samples.keys())
+            raise GroupNotReady("group %s missing %s" % (self.name, missing))
+        fn = sum_series if self.kind == 'series' else sum_parallel
+        return fn(self.samples.values())
 
     def fetch_voltages(self):
         try:
             return sum((self.voltages[name] for name in self.bms_names), [])
         except KeyError as e:
             raise GroupNotReady(e)
+
+
+def resolve_member_ref(bms_by_name: dict, ref: str):
+    """Look up one `group_parallel` member by name or address, or None.
+
+    A group's `address:` is a comma-separated list of refs and is not itself an
+    address, so it never goes through normalize_ble_address() -- while a real BMS
+    is indexed under its *canonical* address. A group referring to its members by
+    lower-case MAC (which was the only spelling that worked before #399) would
+    otherwise miss and abort the whole add-on. Refs are also stripped, since
+    `get_member_refs()` splits on ',' without trimming.
+
+    Names are matched first and exactly, so a device whose alias happens to be
+    MAC-shaped still wins over normalization.
+    """
+    ref = ref.strip()
+    if ref in bms_by_name:
+        return bms_by_name[ref]
+    return bms_by_name.get(normalize_ble_address(ref))
 
 
 class GroupNotReady(Exception):
@@ -45,17 +73,22 @@ class GroupNotReady(Exception):
 
 
 class VirtualGroupBms:
+    KIND = 'parallel'
+
     # TODO inherit from bms base class
     def __init__(self, address: str, name=None, verbose_log=False, **kwargs):
         self.address = address
         self.name = name
-        self.group = BmsGroup(name)
+        self.group = BmsGroup(name, kind=type(self).KIND)
         self.verbose_log = verbose_log
         self.members: List[BtBms] = []
         self.logger = get_logger(verbose_log)
 
     def __str__(self):
-        return 'VirtualGroupBms(%s,[%s])' % (self.name, self.address)
+        return '%s(%s,[%s])' % (type(self).__name__, self.name, self.address)
+
+    def supports_set_soc(self):
+        return False
 
     @property
     def slug(self):
@@ -127,28 +160,6 @@ class VirtualGroupBms:
         raise NotImplementedError()
 
 
-def is_finite(x):
-    return x is not None and math.isfinite(x)
+class SeriesGroupBms(VirtualGroupBms):
+    KIND = 'series'
 
-
-def finite_or_fallback(x, fallback):
-    return x if is_finite(x) else fallback
-
-
-def sum_parallel(samples: Iterable[BmsSample]) -> BmsSample:
-    return BmsSample(
-        voltage=statistics.mean(s.voltage for s in samples),
-        current=sum(s.current for s in samples),
-        power=sum(s.power for s in samples),
-        charge=sum(s.charge for s in samples),
-        capacity=sum(s.capacity for s in samples),
-        total_charge_throughput=sum(s.total_charge_throughput for s in samples),
-        num_cycles=statistics.mean(s.num_cycles for s in samples),
-        soc=sum(s.soc * s.capacity for s in samples) / sum(s.capacity for s in samples),
-        soh=sum(s.soh * s.capacity for s in samples) / sum(s.capacity for s in samples),
-        aged_capacity=sum(s.aged_capacity for s in samples),
-        temperatures=sum(((s.temperatures or []) for s in samples), []),
-        mos_temperature=max((s.mos_temperature for s in samples if is_finite(s.mos_temperature)), default=math.nan),
-        switches={k: v for s in samples for k, v in (s.switches or {}).items()},
-        timestamp=min(s.timestamp for s in samples),
-    )

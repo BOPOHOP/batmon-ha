@@ -1,0 +1,30 @@
+{
+  "devices": [
+    {
+      "address": "A5:C2:39:18:BE:6E",
+      "type": "jbd",
+      "alias": "B300A-01"
+    },
+    {
+      "address": "AC:0A:C0:2B:F5:F3",
+      "type": "tdt",
+      "alias": "B314A-02"
+    }
+  ],
+
+  "mqtt_broker": "10.11.14.35",
+  "mqtt_port": 1883,
+  "mqtt_user": "bag-mq",
+  "mqtt_password": "MpaQTQT65",
+
+  "ble_stack": "bleak",
+
+  "sample_period": 10.0,
+  "publish_period": 20.0,
+  "expire_values_after": 45,
+  "invert_current": true,
+  "keep_alive": true,
+  "watchdog": true,
+  "concurrent_sampling": false,
+  "verbose_log": true
+}

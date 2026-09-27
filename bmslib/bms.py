@@ -46,7 +46,9 @@ class BmsSample:
                  battery_charging: Optional[bool] = None,
                  battery_mode: Optional[str] = None,
                  total_charge_net: float = math.nan,
-                 uptime=math.nan, timestamp: Optional[float] = None):
+                 balancing_cells: Optional[int] = None,
+                 uptime=math.nan, timestamp: Optional[float] = None,
+                 alarms: Optional[Dict[str, bool]] = None):
         """
 
         :param voltage:
@@ -61,6 +63,7 @@ class BmsSample:
         :param balance_current:
         :param temperatures:
         :param mos_temperature:
+        :param alarms: Read-only named BMS alarm states (True means active)
         :param uptime: BMS uptime in seconds
         :param timestamp: seconds since epoch (unix timestamp from time.time())
         """
@@ -121,6 +124,10 @@ class BmsSample:
         # directions). Some BMSes derive cycle count from this divided by
         # design capacity.
         self.total_charge_net: float = total_charge_net
+        # ``balancing_cells``: bitmask of cells the passive balancer is currently
+        # bleeding, bit 0 = cell 1. None if the BMS does not report it (#283).
+        self.balancing_cells: Optional[int] = balancing_cells
+        self.alarms = alarms
         self.uptime = uptime
         self.timestamp = timestamp or time.time()
 
@@ -128,6 +135,8 @@ class BmsSample:
 
         if switches:
             assert all(map(lambda x: isinstance(x, bool), switches.values())), "non-bool switches values %s" % switches
+        if alarms:
+            assert all(map(lambda x: isinstance(x, bool), alarms.values())), "non-bool alarm values %s" % alarms
 
     @property
     def power(self):

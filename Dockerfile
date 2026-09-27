@@ -47,21 +47,27 @@ RUN venv/bin/pip3 install influxdb || true
 # aiobmsble declares bleak>=3.0.2, but requirements.txt pins bleak==2.0.0 for
 # #275. A plain install silently upgraded bleak to 3.0.2 (#383), so install it
 # pinned and with --no-deps to keep the pin. aiobmsble imports no bleak-3-only
-# API; its other runtime dep, bleak-retry-connector, is in requirements.txt.
-RUN venv/bin/pip3 install --no-deps 'aiobmsble==0.25.0' || true
+# API (re-verified for 0.27.0: every aiobmsble.bms module imports under bleak
+# 2.0.0); its other runtime dep, bleak-retry-connector, is in requirements.txt.
+# Pin bump 0.25.0 -> 0.27.0 (#400) is API-breaking on batmon's side: 0.26
+# replaced the BaseBMS `keep_alive=`/`secret=` kwargs with `config=BMSConfig(...)`
+# -- see _bms_config_kwargs() in bmslib/models/BLE_BMS_wrap.py before changing it.
+RUN venv/bin/pip3 install --no-deps 'aiobmsble==0.27.0' || true
 # bumble-bleak: bleak-compatible BLE stack without BlueZ/D-Bus. Installed only in
 # the main `venv` (NOT venv_bleak_pairing, which keeps forked bleak for PSK
 # pairing). Activation is opt-in at runtime: addon_main.sh prepends the shadow
 # dir to PYTHONPATH when `ble_stack: bumble`, which redirects `import bleak`
 # (incl. inside aiobmsble) to bumble-bleak. Best-effort install; if it fails the
 # addon simply runs on real bleak.
-RUN venv/bin/pip3 install bumble 'git+https://github.com/fl4p/bumble-bleak' || true
+# Pinned like bluek below: an unpinned git URL is not reproducible, and Docker
+# layer caching happily reuses a stale clone of it (measured).
+RUN venv/bin/pip3 install bumble 'git+https://github.com/fl4p/bumble-bleak@1df849c' || true
 # bluek (ble_stack: bluek): bleak-compatible stack over the kernel BlueZ stack
 # via L2CAP/mgmt sockets — no D-Bus, no exclusive HCI, coexists with bluetoothd.
 # Pure-Python, no deps. Activated at runtime via PYTHONPATH (addon_main.sh), same
 # as bumble-bleak. Best-effort: if the install fails, ble_stack=bluek warns and
 # falls back to bleak.
-RUN venv/bin/pip3 install 'git+https://github.com/fl4p/bluek@60d1c77' || true
+RUN venv/bin/pip3 install 'git+https://github.com/fl4p/bluek@a206764' || true
 # esphome (ble_stack: esphome): route BLE GATT through one or more ESPHome
 # Bluetooth Proxy devices. Uses habluetooth's BluetoothManager + bleak-esphome
 # and monkey-patches `bleak.BleakClient`/`BleakScanner` to habluetooth's
@@ -75,14 +81,16 @@ RUN venv/bin/pip3 install 'git+https://github.com/fl4p/bluek@60d1c77' || true
 # to bleak at runtime.
 RUN python3 -m venv venv_esphome \
  && venv_esphome/bin/pip3 install paho-mqtt==2.1.0 backoff crcmod pyserial \
- && venv_esphome/bin/pip3 install 'bleak>=3.0.2' habluetooth bleak-esphome aioesphomeapi \
-    'bluetooth-data-tools<1.29' \
+ && venv_esphome/bin/pip3 install 'bleak==3.0.2' 'habluetooth==6.26.11' 'bleak-esphome==4.1.0' \
+    'aioesphomeapi==46.3.0' 'bleak-retry-connector==4.7.0' \
  && venv_esphome/bin/pip3 install influxdb \
- && venv_esphome/bin/pip3 install 'aiobmsble==0.25.0' \
+ && venv_esphome/bin/pip3 install --no-deps 'aiobmsble==0.27.0' \
  || true
-# bluetooth-data-tools<1.29: 1.29.x ships only an x86_64 wheel (upstream
-# regression as of writing). Pin to 1.28.x to keep prebuilt aarch64/armv7
-# musl wheels. Revisit when upstream restores the matrix.
+# Pinned as one set (#401). The former `bluetooth-data-tools<1.29` pin (only
+# x86_64 wheels at the time) silently held habluetooth at 6.1.0 / bleak-esphome
+# 3.8.4 while aioesphomeapi floated; a rebuild that picked up aioesphomeapi 46
+# against that April habluetooth broke every proxy connect. bluetooth-data-tools
+# >= 1.29.22 ships musl aarch64/armv7 wheels again. Bump the four together.
 # armv7 caveat: cryptography/dbus-fast/bleak-esphome have no musl armv7
 # wheels — the install would have to compile, which needs `build-base
 # python3-dev libffi-dev openssl-dev cargo rust pkgconfig`. We don't pull

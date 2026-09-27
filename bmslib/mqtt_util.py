@@ -8,7 +8,6 @@ import asyncio
 import json
 import math
 import queue
-import statistics
 import time
 import traceback
 from unittest.mock import patch
@@ -18,6 +17,8 @@ import paho.mqtt.client as paho
 from bmslib.bms import BmsSample, DeviceInfo, MIN_VALUE_EXPIRY
 from bmslib.bt import BtBms
 from bmslib.util import get_logger
+from bmslib.wire.fields import (round_to_n, capitalize_words, is_none_or_nan,
+                                balancing_cells_str, sample_desc, meter_desc, cell_stats)  # noqa: F401
 
 logger = get_logger()
 
@@ -38,28 +39,6 @@ def json_dumps_with_round_n(some_object, n=7):
 
     with patch('json.encoder._make_iterencode', wraps=inner):
         return json.dumps(some_object)
-
-
-def round_to_n(x, n):
-    # todo compare to np.format_float_positional
-    if isinstance(x, str) or not math.isfinite(x) or not x:
-        return x
-
-    if n == 0:
-        return str(round(x, None))
-
-    digits = -int(math.floor(math.log10(abs(x)))) + (n - 1)
-
-    try:
-        # return ('%.*f' % (digits, x))
-        return str(round(x, digits or None))  # digits=0 will output 12.0, digits=None => 12
-    except ValueError as e:
-        print('error', x, n, e)
-        raise e
-
-
-def capitalize_words(s):
-    return ' '.join(word[0].upper() + word[1:] for word in s.split())
 
 
 def disable_warnings():
@@ -123,131 +102,6 @@ def mqtt_last_publish_time():
     return _last_publish_time
 
 
-def is_none_or_nan(val):
-    if val is None:
-        return True
-    if isinstance(val, float) and (math.isnan(val) or not math.isfinite(val)):
-        return True
-    return False
-
-
-# units: https://github.com/home-assistant/core/blob/d7ac4bd65379e11461c7ce0893d3533d8d8b8cbf/homeassistant/const.py#L384
-sample_desc = {
-    "soc/total_voltage": {
-        "field": "voltage",
-        "device_class": "voltage",
-        "state_class": "measurement",
-        "unit_of_measurement": "V",
-        "precision": 2,
-        "significant_digits": 4,  # round_to_n
-        "icon": "meter-electric"},
-    "soc/current": {
-        "field": "current",
-        "device_class": "current",
-        "state_class": "measurement",
-        "unit_of_measurement": "A",
-        "precision": 2,
-        "significant_digits": 4,
-    },
-    "soc/balance_current": {
-        "field": "balance_current",
-        "device_class": "current",
-        "state_class": "measurement",
-        "unit_of_measurement": "A",
-        "precision": 2,
-        "significant_digits": 4,
-        "icon": "scale-unbalanced"},
-    "soc/soc_percent": {
-        "field": "soc",
-        "device_class": "battery",
-        "state_class": "measurement",
-        "unit_of_measurement": "%",
-        "precision": 2,
-        "significant_digits": 4,
-        "icon": "battery"},
-    "soc/power": {
-        "field": "power",
-        "device_class": "power",
-        "state_class": "measurement",
-        "unit_of_measurement": "W",
-        "precision": 1,
-        "significant_digits": 4,
-        "icon": "flash"},
-    "soc/capacity": {
-        "field": "capacity",
-        "device_class": None,
-        "state_class": None,
-        "unit_of_measurement": "Ah"
-    },
-    "soc/aged_capacity": {
-        "field": "aged_capacity",
-        "device_class": None,
-        "state_class": None,
-        "unit_of_measurement": "Ah",
-        "precision": 2,
-        "icon": "battery-heart-variant"},
-    "soc/soh": {
-        "field": "soh",
-        "device_class": None,
-        "state_class": "measurement",
-        "unit_of_measurement": "%",
-        "precision": 1,
-        "icon": "battery-heart-variant"},
-    # Topic key kept as ``soc/cycle_capacity`` (and therefore HA's unique_id /
-    # entity_id) so existing user automations and long-term statistics keep
-    # working across the rename. The HA display name is auto-derived from
-    # ``field`` and will refresh to "Total Charge Throughput".
-    "soc/cycle_capacity": {
-        "field": "total_charge_throughput",
-        "device_class": None,
-        "state_class": None,
-        "unit_of_measurement": "Ah"},
-    "soc/num_cycles": {
-        "field": "num_cycles",
-        "device_class": None,
-        "state_class": "measurement",
-        "unit_of_measurement": "N",
-        "icon": "battery-sync"},
-    "mosfet_status/capacity_ah": {
-        "field": "charge",
-        "device_class": None,
-        "state_class": None,
-        "unit_of_measurement": "Ah"},
-    "mosfet_status/temperature": {
-        "field": "mos_temperature",
-        "device_class": "temperature",
-        "state_class": "measurement",
-        "unit_of_measurement": "°C",
-        "icon": "thermometer"},
-    "bms/uptime": {
-        "field": "uptime",
-        "device_class": "duration",
-        "state_class": "measurement",
-        "unit_of_measurement": "s",
-        "precision": 0,
-        "icon": "clock"},
-    "bms/runtime": {
-        "field": "runtime",
-        "device_class": "duration",
-        "state_class": "measurement",
-        "unit_of_measurement": "s",
-        "precision": 0,
-        "icon": "timer-sand"},
-    "soc/total_charge_net": {
-        "field": "total_charge_net",
-        "device_class": None,
-        "state_class": "total_increasing",
-        "unit_of_measurement": "Ah",
-        "icon": "battery-arrow-down"},
-    "meter/sample_count": {
-        "field": "num_samples",
-        "device_class": None,
-        "state_class": "measurement",
-        "unit_of_measurement": "N",
-        "icon": "counter"},
-}
-
-
 def publish_sample(client, device_topic, sample: BmsSample):
     for k, v in sample_desc.items():
         topic = f"{device_topic}/{k}"
@@ -261,11 +115,21 @@ def publish_sample(client, device_topic, sample: BmsSample):
             topic = f"{device_topic}/switch/{switch_name}"
             mqtt_single_out(client, topic, 'ON' if switch_state else 'OFF')
 
+    if sample.alarms:
+        for alarm_name, alarm_state in sample.alarms.items():
+            assert isinstance(alarm_state, bool)
+            topic = f"{device_topic}/alarm/{alarm_name}"
+            mqtt_single_out(client, topic, 'ON' if alarm_state else 'OFF')
+
     if sample.problem is not None:
         mqtt_single_out(client, f"{device_topic}/problem",
                         'ON' if sample.problem else 'OFF')
     if sample.problem_code is not None:
         mqtt_single_out(client, f"{device_topic}/problem_code", sample.problem_code)
+
+    if sample.balancing_cells is not None:
+        mqtt_single_out(client, f"{device_topic}/balancing", 'ON' if sample.balancing_cells else 'OFF')
+        mqtt_single_out(client, f"{device_topic}/balancing_cells", balancing_cells_str(sample.balancing_cells))
 
     if sample.battery_charging is not None:
         mqtt_single_out(client, f"{device_topic}/battery_charging",
@@ -287,17 +151,15 @@ def publish_cell_voltages(client, device_topic, voltages):
         topic = f"{device_topic}/cell_voltages/{i + 1}"
         mqtt_single_out(client, topic, voltages[i] / 1000)
 
-    if len(voltages) > 1:
-        x = range(len(voltages))
-        high_i = max(x, key=lambda i: voltages[i])
-        low_i = min(x, key=lambda i: voltages[i])
-        mqtt_single_out(client, f"{device_topic}/cell_voltages/min", voltages[low_i] / 1000)
-        mqtt_single_out(client, f"{device_topic}/cell_voltages/min_index", low_i + 1)
-        mqtt_single_out(client, f"{device_topic}/cell_voltages/max", voltages[high_i] / 1000)
-        mqtt_single_out(client, f"{device_topic}/cell_voltages/max_index", high_i + 1)
-        mqtt_single_out(client, f"{device_topic}/cell_voltages/delta", (voltages[high_i] - voltages[low_i]) / 1000)
-        mqtt_single_out(client, f"{device_topic}/cell_voltages/average", round(sum(voltages) / len(voltages)) / 1000)
-        mqtt_single_out(client, f"{device_topic}/cell_voltages/median", statistics.median(voltages) / 1000)
+    stats = cell_stats(voltages)
+    if stats:
+        mqtt_single_out(client, f"{device_topic}/cell_voltages/min", stats['min_mv'] / 1000)
+        mqtt_single_out(client, f"{device_topic}/cell_voltages/min_index", stats['min_index'])
+        mqtt_single_out(client, f"{device_topic}/cell_voltages/max", stats['max_mv'] / 1000)
+        mqtt_single_out(client, f"{device_topic}/cell_voltages/max_index", stats['max_index'])
+        mqtt_single_out(client, f"{device_topic}/cell_voltages/delta", stats['delta_mv'] / 1000)
+        mqtt_single_out(client, f"{device_topic}/cell_voltages/average", stats['avg_mv'] / 1000)
+        mqtt_single_out(client, f"{device_topic}/cell_voltages/median", stats['median_mv'] / 1000)
 
 
 def publish_temperatures(client, device_topic, temperatures):
@@ -309,9 +171,20 @@ def publish_temperatures(client, device_topic, temperatures):
             mqtt_single_out(client, topic, round_to_n(temperatures[i], 4))
 
 
+# An accepted impedance window is published once, not refreshed every cycle, so
+# the entity needs an expiry of its own: a day without a new accepted window and
+# HA shows it unavailable instead of an old number that looks current.
+CELL_RESISTANCE_EXPIRE_S = 24 * 3600
+
+
+def publish_cell_resistance(client, device_topic, value_mohm: float):
+    mqtt_single_out(client, f"{device_topic}/cell_resistance", round_to_n(value_mohm, 3))
+
+
 def publish_hass_discovery(client, device_topic, expire_after_seconds: int, sample: BmsSample, num_cells,
                            temperatures,
-                           device_info: DeviceInfo = None):
+                           device_info: DeviceInfo = None, set_soc=False, cell_resistance=False,
+                           pack_temp_est=False):
     discovery_msg = {}
 
     # HA discovery node_id must match [a-zA-Z0-9_-] (no slashes), so flatten
@@ -328,7 +201,7 @@ def publish_hass_discovery(client, device_topic, expire_after_seconds: int, samp
     }
 
     def _hass_discovery(k, device_class, unit, state_class=None, icon=None, name=None, long_expiry=False,
-                        precision=None):
+                        precision=None, expire_after=None):
         dm = {
             "unique_id": f"{device_topic}__{k.replace('/', '_')}",
             "name": name or capitalize_words(k.replace('/', ' ')),
@@ -340,7 +213,7 @@ def publish_hass_discovery(client, device_topic, expire_after_seconds: int, samp
             "suggested_display_precision": precision,
             # "json_attributes_topic": f"{device_topic}/{k}",
             "state_topic": f"{device_topic}/{k}",
-            "expire_after": max(expire_after_seconds, 3600 * 2) if long_expiry else expire_after_seconds,
+            "expire_after": expire_after or (max(expire_after_seconds, 3600 * 2) if long_expiry else expire_after_seconds),
             "device": device_json,
         }
         if icon:
@@ -380,20 +253,19 @@ def publish_hass_discovery(client, device_topic, expire_after_seconds: int, samp
         if not is_none_or_nan(temperatures[i]):
             _hass_discovery(k, "temperature", state_class="measurement", unit="°C", precision=1)
 
-    meters = {
-        # state_class see https://developers.home-assistant.io/docs/core/entity/sensor/#long-term-statistics
-        # this enables the meters to appear in HA Energy Grid
-        'total_energy': dict(device_class="energy", unit="kWh", icon="meter-electric", name="total energy netted"),
-        # state_class="total",
-        'total_energy_charge': dict(device_class="energy", state_class="total_increasing", unit="kWh",
-                                    icon="meter-electric", name="total energy input"),
-        'total_energy_discharge': dict(device_class="energy", state_class="total_increasing", unit="kWh",
-                                       icon="meter-electric", name="total energy output"),
-        'total_charge': dict(device_class=None, unit="Ah", name="total charge netted"),
-        'total_cycles': dict(device_class=None, unit="N", icon="battery-sync", name="total cycle count"),
-    }
-    for name, m in meters.items():
+    for name, m in meter_desc.items():
         _hass_discovery('meter/%s' % name, **m, long_expiry=True, precision=2)
+
+    if cell_resistance:
+        # experimental, see bmslib/impedance.py: median per-cell resistance [mOhm]
+        _hass_discovery('cell_resistance', None, "mΩ", state_class="measurement", icon="resistor",
+                        name="Cell Resistance", precision=2, expire_after=CELL_RESISTANCE_EXPIRE_S)
+
+    if pack_temp_est:
+        # pack_temp_estimator: RC estimate of the cell temperature from MOS + ambient
+        # (bmslib/pack_temp_publisher.py publishes the state on this topic)
+        _hass_discovery('pack_temp_est', "temperature", "°C", state_class="measurement",
+                        name="Pack Temp (RC est.)", precision=1)
 
     if sample.problem is not None:
         discovery_msg[f"homeassistant/binary_sensor/{node_id}/problem/config"] = {
@@ -414,6 +286,38 @@ def publish_hass_discovery(client, device_topic, expire_after_seconds: int, samp
             "expire_after": expire_after_seconds,
             "device": device_json,
             "icon": "mdi:alert-circle-outline",
+        }
+
+    if sample.alarms:
+        for alarm_name in sample.alarms:
+            discovery_msg[f"homeassistant/binary_sensor/{node_id}/alarm_{alarm_name}/config"] = {
+                "unique_id": f"{device_topic}__alarm_{alarm_name}",
+                "name": alarm_name.upper(),
+                "device_class": "problem",
+                "entity_category": "diagnostic",
+                "state_topic": f"{device_topic}/alarm/{alarm_name}",
+                "expire_after": expire_after_seconds,
+                "device": device_json,
+            }
+
+    if sample.balancing_cells is not None:
+        discovery_msg[f"homeassistant/binary_sensor/{node_id}/balancing/config"] = {
+            "unique_id": f"{device_topic}__balancing",
+            "name": "balancing",
+            "entity_category": "diagnostic",
+            "state_topic": f"{device_topic}/balancing",
+            "expire_after": expire_after_seconds,
+            "device": device_json,
+            "icon": "mdi:scale-balance",
+        }
+        discovery_msg[f"homeassistant/sensor/{node_id}/balancing_cells/config"] = {
+            "unique_id": f"{device_topic}__balancing_cells",
+            "name": "balancing cells",
+            "entity_category": "diagnostic",
+            "state_topic": f"{device_topic}/balancing_cells",
+            "expire_after": expire_after_seconds,
+            "device": device_json,
+            "icon": "mdi:scale-balance",
         }
 
     if sample.battery_charging is not None:
@@ -462,6 +366,20 @@ def publish_hass_discovery(client, device_topic, expire_after_seconds: int, samp
                 "command_topic": f"homeassistant/switch/{node_id}/{switch_name}/set",
             }
 
+    if set_soc:
+        # HA `number` that writes the BMS' SOC gauge (Daly, #144). State follows the reported SOC.
+        discovery_msg[f"homeassistant/number/{node_id}/set_soc/config"] = {
+            "unique_id": f"{device_topic}__set_soc",
+            "name": "set SOC",
+            "entity_category": "config",
+            "icon": "mdi:battery-sync",
+            "unit_of_measurement": "%",
+            "min": 0, "max": 100, "step": 1, "mode": "box",
+            "state_topic": f"{device_topic}/soc/soc_percent",
+            "command_topic": f"homeassistant/number/{node_id}/set_soc/set",
+            "device": device_json,
+        }
+
     for topic, data in discovery_msg.items():
         j = json.dumps(data)
         logger.debug('discovery msg %s: %s', topic, j)
@@ -470,6 +388,27 @@ def publish_hass_discovery(client, device_topic, expire_after_seconds: int, samp
 
 _switch_callbacks = {}
 _message_queue = queue.Queue()
+
+# Topics we only READ (e.g. ambient temperatures for the pack-temp estimator).
+# Unlike _switch_callbacks these are plain functions, called directly on the
+# paho network thread: the callee must be thread-safe and must not block.
+_state_callbacks = {}
+
+
+def register_state_topic(topic: str, callback):
+    """Route messages on `topic` to `callback(payload: str)`. Takes effect for the
+    broker at the next subscribe_state_topics() -- call that from on_connect, so
+    the subscription survives a broker restart (clean session). Exact topics
+    only: dispatch is a dict lookup on the message topic."""
+    if '+' in topic or '#' in topic:
+        raise ValueError('wildcards are not supported in a state topic: %r' % topic)
+    _state_callbacks[topic] = callback
+
+
+def subscribe_state_topics(mqtt_client: paho.Client):
+    for topic in _state_callbacks:
+        logger.debug("subscribe %s", topic)
+        mqtt_client.subscribe(topic, qos=0)
 
 
 async def mqtt_process_action_queue():
@@ -500,8 +439,35 @@ def subscribe_switches(mqtt_client: paho.Client, device_topic, bms: BtBms, switc
             lambda msg, sn=switch_name: set_switch(sn, msg.lower() == "on")
 
 
+def subscribe_set_soc(mqtt_client: paho.Client, device_topic, bms: BtBms):
+    async def set_soc(payload: str):
+        soc = float(payload)
+        logger.info('Set %s SOC gauge to %.1f%%', bms.name, soc)
+        await bms.set_soc(soc)
+
+    node_id = device_topic.replace('/', '_')
+    topic = f"homeassistant/number/{node_id}/set_soc/set"
+    logger.debug("subscribe %s", topic)
+    mqtt_client.subscribe(topic, qos=2)
+    _switch_callbacks[topic] = set_soc
+
+
 def mqtt_message_handler(client, userdata, message: paho.MQTTMessage):
-    payload = message.payload.decode("utf-8")
+    # runs on paho's network thread: an exception here would end that thread,
+    # and a state topic carries whatever the user pointed it at
+    try:
+        payload = message.payload.decode("utf-8")
+    except UnicodeDecodeError:
+        logger.warning('ignoring a non-UTF-8 message on %s', message.topic)
+        return
+    state_cb = _state_callbacks.get(message.topic)
+    if state_cb is not None:
+        logger.debug("received state %s: %s", message.topic, payload)
+        try:
+            state_cb(payload)
+        except Exception as e:
+            logger.warning('state callback for %s failed: %s', message.topic, e)
+        return
     logger.info("received msg %s: %s", message.topic, payload)
     callback = _switch_callbacks.get(message.topic, None)
     if callback:

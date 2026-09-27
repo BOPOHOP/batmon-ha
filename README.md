@@ -18,6 +18,7 @@ I created this to compare BMS readings for a detailed evaluation of BMS reliabil
 * Energy consumption meters (using trapezoidal power integrators)
 * Integrates with Home Assistant Energy dashboard and [Utility Meter](doc/HA%20Energy%20Dashboard.md) sensor helper
 * Control BMS charging and discharging switches
+* Set the SOC gauge from HA via a `set SOC` number entity, e.g. to reset a drifted gauge to 0 % after a low-voltage cut-off: Daly (`daly`, `daly_uart`) and JK with firmware >= 11 (`jk`, `jk_32s`) (#144)
 * Home Assistant MQTT Discovery
 * Can run as stand-alone app without Home-Assistant and directly write to [InfluxDB](doc/InfluxDB.md)
 * Battery Groups for parallel batteries, see [doc/Groups.md](doc/Groups.md)
@@ -35,13 +36,20 @@ read-only access.
 batmon device connectors:
 
 * JK BMS / jikong with JK02 protocol (`jk` over BLE, `jk_uart` over RS485 — see [Serial / RS485](#serial--rs485))
+* JK-PB inverter BMS (PB1A16S, PB2A16S, ...; `jk` over BLE, `jk_pb_uart` over RS485)
 * Daly BMS (`daly`, `daly2`, `daly_ble` over BLE, `daly_uart` over RS485 — see [Serial / RS485](#serial--rs485))
+* JBD / Xiaoxiang / LLT BMS (`jbd` over BLE, `jbd_uart` over TTL UART or RS485)
+* Seplos V2 BMS, 48 V rack packs (`seplos_ble`, `seplos_v2_ble` over BLE, `seplos_uart` over RS485)
+* Renogy smart lithium batteries (`renogy_ble` over BLE via the BT-2 dongle, `renogy_uart` over RS485)
 * JBD / Jiabaida/ Xiaoxiang / Overkill Solar BMS (`jbd`)
 * ANT BMS (`ant`)
 * Supervolt BMS (`supervolt`)
 * SOK / ABC-BMS (`sok`, routed through the aiobmsble `abc_bms` decoder; use `sok_legacy` for the pre-2023 native driver)
 * Basen BMS (`basen`), ported from [syssi/esphome-basen-bms](https://github.com/syssi/esphome-basen-bms)
 * LiTime BMS (`litime`)
+* Legacy Offgridtec OGT-12200 / Topband batteries (`offgridtec`): unsolicited FFE4 ASCII-hex protocol
+* BM6 Bluetooth car battery monitor (`bm6`): voltage, temperature, SOC and charging/low-voltage state, no current (#160)
+* Quicklynks BM2 and rebrands such as the Ancel BM200 (`bm2`): voltage and SOC (#41)
 * Generic no-name Chinese BMS with Modbus RTU over Nordic UART (`noname_modbus`) — see [issue #131](https://github.com/fl4p/batmon-ha/issues/131)
 * Victron SmartShunt (make sure to update to the latest firmware
   and [enable GATT](https://community.victronenergy.com/questions/93919/victron-bluetooth-ble-protocol-publication.html)
@@ -92,7 +100,7 @@ Add an entry for each device, such as:
 - address: CC:44:8C:F7:AD:BB
   type: jk
   alias: battery1            # MQTT topic prefix (regex [\w_.-/])
-  pin: "12345"               # pairing PSK, victron only (optional)
+  pin: "12345"               # pairing PIN, victron and newer JBD firmware (optional)
   adapter: "hci0"            # switch the bluetooth hw adapter (optional)
   debug: true                # verbose log for this device only (optional)
   current_calibration: 1.0   # current [I] correction factor (optional)
@@ -102,15 +110,25 @@ Add an entry for each device, such as:
 find a list of visible Bluetooth devices in the add-on log. Alternatively you can enter the device name here as
 displayed in the discovery list.
 
-`type` can be `jk`, `jk_24s`, `jk_32s`, `jk_uart`, `jbd`, `ant`, `daly`, `daly2`, `daly_ble`, `daly_uart`,
-`pace_uart`, `supervolt`, `sok`, `sok_legacy`, `basen`, `basen_uart`, `litime`, `victron`, or any tag listed under [Supported BLE Devices](#supported-ble-devices).
+`type` can be `jk`, `jk_24s`, `jk_32s`, `jk_uart`, `jk_pb_uart`, `jbd`, `jbd_uart`, `ant`, `daly`, `daly2`, `daly_ble`, `daly_uart`,
+`pace_uart`, `seplos_uart`, `braunpwr_uart`, `renogy_uart`, `supervolt`, `sok`, `sok_legacy`, `basen`, `basen_uart`, `litime`, `offgridtec`, `bm6`, `bm2`, `victron`, or any tag listed under [Supported BLE Devices](#supported-ble-devices).
 For a mock BMS use `dummy`.
 
 With the `alias` field you can set the MQTT topic prefix and the name as displayed in Home Assistant.
 Otherwise, the name as found in Bluetooth discovery is used.
 
-If the device requires a PIN when pairing (currently Victron SmartShunt only) add `pin: "123456"` (and replace 123456
-with device's PIN).
+If the device requires a PIN when pairing add `pin: "123456"` (and replace 123456 with the device's PIN). This is the
+case for the Victron SmartShunt and for newer JBD firmware (Liontron and other packs whose app asks for a 6-digit
+password): those BMS only answer after a passkey pairing, batmon pairs with the given `pin` and then talks the normal
+JBD protocol (#217). Felicity packs whose firmware update renamed them from `F07…` to `SolarB_…` need this too (#415, upstream
+[BMS_BLE-HA#735](https://github.com/patman15/BMS_BLE-HA/issues/735)). Three FLB48314TG1-H packs were confirmed
+working once every pack was bonded — but bonding alone was not enough there: one pack was already bonded and still
+failed with `failed to discover services, device disconnected` until Home Assistant's own Bluetooth integration was
+disabled, which frees the adapter from scan contention. If a bonded pack still fails, try that next.
+
+The bond is made by BlueZ (the same operation as `bluetoothctl pair`), before the add-on starts sampling, and stays in
+place afterwards. It needs a local Bluetooth adapter: an ESPHome proxy can be asked to pair, but has no agent to answer
+a PIN prompt, so a device with a `pin:` has to be reached through an adapter on the machine running the add-on.
 
 Add `adapter: "hci1"` to select a bluetooth adapter other than the default one.
 
@@ -126,16 +144,32 @@ For verbose logs of particular BMS add `debug: true`.
 * `keep_alive` will never close the bluetooth connection. Use for higher sampling rate. You will not be able to connect
   to the BMS from your phone anymore while the add-on is running.
 * `sample_period` is the time in seconds to wait between BMS reads. Small periods generate more data points per time.
+  It does *not* change how long a BMS is given to answer — see `ble_request_timeout` for that.
+* `ble_request_timeout` is how long an `aiobmsble` device (`felicity`, `daly_ble`, any tag from
+  [Supported BLE Devices](#supported-ble-devices)) gets to answer one request, in seconds. The default is the library's
+  5 s, split over three attempts with doubling waits (0.71 s, 1.43 s, 2.86 s), so a pack slower than 0.71 s only
+  answers on a retry. Raise it (e.g. `12`) if a device times out in `_await_msg` while others on the same adapter are
+  being polled. Note that a device whose write mode aiobmsble has not pinned down yet runs that sequence twice (once
+  per mode), so a fully silent pack takes about **twice** the configured value before it gives up — and a slow poll
+  pushes out the whole cycle, since `sample_period` is slept *after* the poll, not instead of it. It is necessarily
+  global: aiobmsble holds the value on its base class, so it applies to every `_ble` device at once, and a per-device
+  setting would be a lie (#415).
 * Set `publish_period` to a higher value than `sample_period` to throttle MQTT data, while sampling BMS for accurate
   energy meters. On publish, samples since previous publish are averaged. Periods shorter than 2s can slow down history
   plots in HA.
 * `invert_current` changes the sign of the current. Normally it is positive during discharge, inverted its negative.
 * `expire_values_after` time span in seconds when sensor values become "Unavailable"
+* `impedance_estimator` (experimental, off by default) estimates the per-cell resistance of LiFePO4 packs and publishes
+  it as a `Cell Resistance` sensor in mΩ. See [doc/Cell Resistance.md](doc/Cell%20Resistance.md).
+* `pack_temp_estimator` (experimental, off by default) estimates the cell temperature of packs whose BMS only reports a
+  MOSFET temperature, as a `Pack Temp (RC est.)` sensor. `pack_temp_room_topic` / `pack_temp_outdoor_topic` are MQTT
+  topics carrying ambient temperatures (e.g. from HA's `mqtt_statestream`); both are optional, without them the
+  estimate follows the MOSFET temperature, damped. See [bmslib/PACK_TEMP_RC_INTEGRATION.md](bmslib/PACK_TEMP_RC_INTEGRATION.md).
 * `watchdog` stops the program on too many errors (make sure to enable the Home Assistant watchdog to restart the add-on
   after it exits)
 * For JK bms: set `type` to `jk_24s` for the older 24s version (firmware<11.x), `jk_32s` for the newer 32s version (fw>
   =11.x), or `jk` if you don't know (might cause invalid battery data when detection fails)
-* type `daly2` is for a newer Daly BMS version which is untested
+* type `daly2` is for Daly BMS with the newer Bluetooth module (Modbus-over-BLE, GATT service `fff0` with `fff1/fff2`; the `daly` type logs `Characteristic ... was not found` on these). Reads, cell voltages and MOSFET switches work, see [issue #356](https://github.com/fl4p/batmon-ha/issues/356)
 
 ## Serial / RS485
 
@@ -154,9 +188,33 @@ Supported types (baud rate in parentheses):
   ([#276](https://github.com/fl4p/batmon-ha/issues/276)).
 * `basen_uart` (9600) — Basen binary `7E … 0D` protocol; distinct from the
   BLE `basen`.
+* `jbd_uart` (9600) — JBD / Xiaoxiang / LLT, same `DD … 77` frames as the BLE
+  `jbd` (the BLE module is a UART bridge); TTL UART header or RS485 port.
+* `jk_pb_uart` (115200) — JK-PB inverter BMS (PB1A16S, PB2A16S, ...) on its
+  RS485-1 port: a Modbus FC16 trigger, answered with the JK02_32S frame the BLE
+  driver decodes. `jk_pb_uart:<n>` selects the RS485 address set in the JK app
+  (default 1). The older `jk_uart` TLV protocol does not work on PB models.
+* `seplos_uart` (19200) — Seplos V2 (BMS 1.0/2.0 hardware) ASCII protocol
+  (`~2000 46 42 …\r`); `seplos_uart:<addr>` for the pack address (default 0),
+  `seplos_uart:<addr>:9600` for the RS232 console port. Seplos V3 (Modbus) is
+  not covered.
+* `braunpwr_uart` (9600) — BraunPWR packs with the KS48100 rack BMS: YD/T 1363
+  ASCII protocol (`>22 01 4A 42 …\r`, command 42H). `braunpwr_uart:<addr>` for
+  the pack address (default 1). It follows the DIP switch, but how is
+  unverified; if nothing answers, try 1 to 16. Built from a user's
+  working ESPHome config (an ESP32 fitted in place of the BMS's FC41D WiFi/BLE
+  module) and the manufacturer's protocol PDF. Wiring is unconfirmed: the
+  FC41D module's header or the BMS's RS485 port
+  ([#403](https://github.com/fl4p/batmon-ha/discussions/403)).
+* `renogy_uart` (9600) — Renogy smart lithium (RBT100LFP12, RBT200LFP12S, ...)
+  Modbus RTU; `renogy_uart:<id>` for the slave id (default `0x30`; the
+  RBT100LFP12SH-G1 uses `0xF7`).
 
-`pace_uart` and `basen_uart` decoders are unit-tested against captured
-frames but not yet confirmed on live hardware — feedback welcome.
+`pace_uart`, `basen_uart`, `jbd_uart`, `jk_pb_uart`, `seplos_uart`,
+`braunpwr_uart` and `renogy_uart` decoders are unit-tested against captured or
+reference frames but not yet confirmed on live hardware — feedback welcome. The
+protocols were ported from dbus-serialbattery, aiobmsble and the syssi ESPHome
+components; see the module docstrings for the exact sources.
 
 Example config:
 
@@ -186,8 +244,33 @@ the factory default 1 answers nothing at all. Append it to the type:
   alias: battery2
 ```
 
-Daly's PC tool calls this "Board No". One BMS per adapter for now: several
-Daly on a shared RS485 bus is [#398](https://github.com/fl4p/batmon-ha/issues/398).
+Daly's PC tool calls this "Board No".
+
+### Several Daly on one RS485 bus
+
+Give each unit a distinct board number in Daly's PC tool, then point them all at
+the same `adapter:` — one USB adapter for the whole string, not one each:
+
+```yaml
+- address: serial
+  adapter: /dev/ttyUSB0
+  type: daly_uart:1
+  alias: battery1
+- address: serial
+  adapter: /dev/ttyUSB0     # same port
+  type: daly_uart:2
+  alias: battery2
+```
+
+Batmon opens the port once, shares it, and routes each reply to the unit whose
+board number it carries. Requests are serialized across the bus, so this is safe
+with `concurrent_sampling` too (RS485 is half duplex — only one unit may
+transmit at a time).
+
+Two units configured with the *same* board number are rejected at connect: they
+would answer each other's requests and publish each other's readings. Mixing
+families on one port (say `jk_uart` at 115200 and `daly_uart` at 9600) is
+rejected for the same reason — one wire cannot run two baud rates.
 
 ### Troubleshooting a silent wired link
 
@@ -204,9 +287,15 @@ answers (or that nothing does):
 python3 tools/daly_serial_probe.py /dev/serial/by-id/usb-FTDI_...-port0
 ```
 
-Note that Daly's UART (TTL) and RS485 ports are different RJ45 sockets with
-different pinouts, and on many boards the UART port is shared with the
-Bluetooth module — only one of the two can talk at a time.
+Wiring, as confirmed on a Daly 4S in [#398](https://github.com/fl4p/batmon-ha/issues/398):
+the Daly-supplied XH 5-pin RS485/CAN cable is pin 1 = B−, pin 2 = A+,
+pin 3 = GND, pins 4–5 = CAN. **GND must be connected** — without it there is no
+communication at all. A plain FTDI USB-RS485 adapter works.
+
+Daly's UART (TTL) and RS485 are separate ports with different pinouts. On some
+boards they share one UART with the Bluetooth module, so BT and a wired link
+cannot both be used; on others (including recent ones with two UART headers)
+they run at the same time. If in doubt, unplug the BT module and retest.
 
 To request another BMS family over RS485, open an issue with a captured
 frame (`tcpdump` of the USB-serial line, or a wireshark log from the
@@ -283,6 +372,14 @@ adapter:
 
 (For `address: serial` / RS-485 BMSes, `adapter:` is the serial port path like `/dev/ttyUSB0`,
 independent of `ble_stack`.)
+
+`adapter:` can also be set once at the top level of the configuration, next to `ble_stack:`. It
+is then the default for every device that doesn't carry its own, and the log says which devices
+inherited it. Because the value means two different things, only matching devices inherit: a
+controller (`hci1`, or its MAC) goes to BLE devices, an absolute port path (`/dev/ttyUSB0`) to
+wired ones. Groups and commented-out devices never inherit. A top-level `adapter:` that reaches
+no device — or that is neither a controller nor an absolute path — is reported instead of
+quietly doing nothing (#414).
 
 ## Energy Meters
 

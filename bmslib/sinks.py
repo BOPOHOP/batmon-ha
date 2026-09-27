@@ -397,6 +397,21 @@ class QuestDBSink(InfluxDBSink):
             })
 
 
+def telemetry_address(bms) -> str:
+    """The address string telemetry derives its anonymous device id from.
+
+    Deliberately the *pre-canonicalization* spelling (`address_raw`). The
+    telemetry measurement name is `slug + '_' + hash(address)`, so switching to
+    the canonical address in #399 would have moved every user who had configured
+    a lower-case MAC onto a brand-new table and split their own history at the
+    upgrade. Hashing what they originally configured keeps that identity stable.
+
+    This is the one legitimate use of `address_raw`. Anything that scans,
+    connects or resolves must use `bms.address`.
+    """
+    return getattr(bms, 'address_raw', None) or bms.address
+
+
 def hash_urlsafe(s: str):
     if not s:
         return None
@@ -424,18 +439,43 @@ def get_disk_id():
     return str(r['data']['data_disk']) or None
 
 
+TELEMETRY_HOST = "tm.fabi.me"
+
+
+def telemetry_transport(probe_timeout=5) -> dict:
+    """Connection kwargs for the telemetry server.
+
+    Prefer TLS: Traefik on :443 fronts the write endpoint with a Let's Encrypt
+    cert (#379). If that probe fails (cert lapsed, port filtered, no CA bundle
+    on an odd build) fall back to the plain :8086 endpoint that older add-on
+    versions use, and say so, rather than silently losing telemetry.
+    """
+    try:
+        import requests
+        r = requests.get("https://%s/ping" % TELEMETRY_HOST, timeout=probe_timeout)
+        if r.status_code in (200, 204):
+            return dict(host=TELEMETRY_HOST, port=443, ssl=True, verify_ssl=True)
+        why = "HTTP %d" % r.status_code
+    except Exception as e:
+        why = str(e) or type(e).__name__
+    logger.warning("telemetry: TLS endpoint https://%s unreachable (%s), "
+                   "falling back to plain http on :8086", TELEMETRY_HOST, why)
+    return dict(host=TELEMETRY_HOST, port=8086, ssl=False)
+
+
 class TelemetrySink(QuestDBSink):
 
-    def __init__(self, bms_by_name: Dict[str, BtBms]):
+    def __init__(self, bms_by_name: Dict[str, BtBms], transport: dict = None):
         super().__init__(
             flush_interval=120,
             backoff_interval=3600,
-            host="tm.fabi.me",
             username="batmon_wo",
             password="no" + "secret",
             database="batmon_tele",
-            ssl=False
+            **(transport or telemetry_transport()),
         )
+        self.url = "%s://%s:%d" % ("https" if self.influxdb_client._scheme == "https" else "http",
+                                   self.influxdb_client._host, self.influxdb_client._port)
         bms_by_name = {n: bms for n, bms in bms_by_name.items() if not bms.is_virtual}
         self.uid = get_user_id()
         try:
@@ -443,20 +483,24 @@ class TelemetrySink(QuestDBSink):
         except:
             self.did = None
 
-        self.addrh_by_name = {n: hash_urlsafe(bms.address) for n, bms in bms_by_name.items()}
+        self.addrh_by_name = {n: hash_urlsafe(telemetry_address(bms)) for n, bms in bms_by_name.items()}
         self.slug_by_name = {n: bms.slug for n, bms in bms_by_name.items()}
 
         self.sample_interval = 15
-        self._last_pub: Dict[str, float] = {}
+        # keyed (bms_name, kind): sample and voltages each get their own slot.
+        # With a shared one, whichever call first crossed the 15 s mark took the
+        # slot and kept that phase, so a device sent pack samples or cell
+        # voltages, rarely both.
+        self._last_pub: Dict[tuple, float] = {}
 
         # logger.info("tele started, uid='%s' did='%s' addr=%s", self.uid, self.did, self.slug_by_name)
         self.silent = True
 
-    def _should_sample(self, bms_name) -> bool:
+    def _should_sample(self, bms_name, kind) -> bool:
         now = time.time()
-        if now - self._last_pub.get(bms_name, 0) < self.sample_interval:
+        if now - self._last_pub.get((bms_name, kind), 0) < self.sample_interval:
             return False
-        self._last_pub[bms_name] = now
+        self._last_pub[(bms_name, kind)] = now
         return True
 
     def publish_sample(self, bms_name, sample: BmsSample, tags=None):
@@ -464,7 +508,7 @@ class TelemetrySink(QuestDBSink):
             return
         if 'dummy' in self.slug_by_name[bms_name]:
             return
-        if not self._should_sample(bms_name):
+        if not self._should_sample(bms_name, 'sample'):
             return
         tags_ = dict(uid=self.uid, did=self.did, addrh=self.addrh_by_name[bms_name], slug=self.slug_by_name[bms_name])
         tags and tags_.update(tags)
@@ -480,7 +524,9 @@ class TelemetrySink(QuestDBSink):
             return
         if 'dummy' in self.slug_by_name[bms_name]:
             return
-        if not self._should_sample(bms_name):
+        if not voltages:
+            return  # a failed fetch must not use up the slot
+        if not self._should_sample(bms_name, 'voltages'):
             return
         tags_ = dict(uid=self.uid, did=self.did, addrh=self.addrh_by_name[bms_name], slug=self.slug_by_name[bms_name])
         tags and tags_.update(tags)

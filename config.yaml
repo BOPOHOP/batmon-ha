@@ -1,7 +1,7 @@
 name: "Batmon"
 description: "Monitor various BMS over bluetooth"
 url: https://github.com/fl4p/batmon-ha
-version: "2.15"
+version: "2.21"
 slug: "batmon"
 init: false
 host_dbus: true
@@ -29,6 +29,17 @@ privileged:
 # only a capability list — it does NOT expose device nodes — so without `uart:`
 # the serial port the user configures simply isn't visible inside the add-on.
 uart: true
+
+# Web GUI. Ingress works with host_network: true -- the Supervisor builds the
+# destination from the add-on's ip_address, and a host-network add-on reports the
+# Docker network gateway, not a nonexistent container IP.
+# The port is declared but NOT published: with host_network the socket is on the
+# host anyway, so `gui_allow_direct` (default false under HA) is what actually
+# gates non-ingress access. Ingress requests are authenticated by Home Assistant.
+ingress: true
+ingress_port: 8099
+panel_icon: "mdi:car-battery"
+panel_title: "Batmon"
 
 homeassistant_api: true # http://supervisor/core/api
 hassio_api: true        # http://supervisor
@@ -61,7 +72,10 @@ options:
   watchdog: true
   expire_values_after: 20
   bt_power_cycle: false
+  bt_power_cycle_on_error: false
   ble_stack: bleak
+  gui: true
+  gui_port: 8099
   # sample_period/publish_period/expire_values_after are kept here (and required
   # in the schema) so they render as normal, always-visible fields. They must NOT
   # live in the collapsed "unused optional configuration options" section: edits
@@ -75,6 +89,7 @@ options:
   #       name: "garage-proxy"
   bluetooth_proxies: []
   telemetry: true
+  impedance_estimator: false
 
 schema:
   devices:
@@ -105,7 +120,29 @@ schema:
   concurrent_sampling: "bool?"
   verbose_log: "bool?"
 
+  # How long an aiobmsble (`_ble`) device gets to answer one request, in
+  # seconds, split over 3 attempts with doubling waits. Library default 5.
+  # Necessarily global: aiobmsble holds it on the class (#415).
+  ble_request_timeout: "float(0.5,120)?"
+
   bt_power_cycle: "bool?"
+
+  # Last-resort recovery: power-cycle the controller when reconnecting one BMS
+  # keeps failing. Drops every BLE connection, so it stays off by default and is
+  # rate-limited to one cycle per BT_POWER_CYCLE_MIN_INTERVAL (bmslib/sampling.py).
+  bt_power_cycle_on_error: "bool?"
+
+  # Drop each keep_alive BLE link every N minutes (+/-20% jitter) so the next
+  # connect re-picks the backend/proxy. Only useful with several esphome
+  # proxies; each reconnect costs a few seconds of data. 0/unset = off.
+  reconnect_interval_minutes: "float?"
+
+  # Default `adapter:` for devices that don't set their own (see the per-device
+  # `adapter:` in the devices schema above). A BlueZ controller ("hci1") is
+  # inherited by BLE devices, a port ("/dev/ttyUSB0") by wired ones. Users set
+  # this at the top level expecting exactly that, so it is honoured instead of
+  # ignored (#414).
+  adapter: "str?"
 
   # "bleak" = stock BlueZ/D-Bus stack (default); "bumble" = bumble-bleak
   # (pure-Python HCI, no BlueZ/D-Bus) which takes exclusive ownership of the
@@ -115,6 +152,14 @@ schema:
   # "esphome" routes GATT through one or more ESPHome Bluetooth Proxy devices
   # (no local adapter touched — see `bluetooth_proxies:`).
   ble_stack: "list(bleak|bumble|bluek|esphome)?"
+
+  # Web GUI (see doc/GUI.md). `gui_port` is only used standalone -- under HA the
+  # Supervisor proxies to `ingress_port` above, so changing gui_port there would
+  # silently break ingress. `gui_allow_direct` defaults to false under HA.
+  gui: "bool?"
+  gui_port: "int(1,65535)?"
+  gui_push_period: "float?"
+  gui_allow_direct: "bool?"
 
   bluetooth_proxies:
     - host: str
@@ -129,3 +174,17 @@ schema:
   influxdb_database: "str?"
 
   telemetry: "bool?"
+
+  # Experimental: estimate the per-cell resistance of LiFePO4 packs from the
+  # sampled current and cell voltages, published as a `cell_resistance` sensor
+  # (mOhm). See doc/Cell Resistance.md.
+  impedance_estimator: "bool?"
+
+  # Experimental: estimate the cell temperature of packs whose BMS only reports
+  # a MOSFET temperature, as a `pack_temp_est` sensor. Room/outdoor topics are
+  # MQTT state topics (e.g. from HA's mqtt_statestream); either may be left
+  # out, the estimate then runs on what is there. See bmslib/PACK_TEMP_RC_INTEGRATION.md.
+  pack_temp_estimator: "bool?"
+  pack_temp_room_topic: "str?"
+  pack_temp_outdoor_topic: "str?"
+  pack_temp_ambient_max_age: "float?"

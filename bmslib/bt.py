@@ -1,5 +1,4 @@
 import asyncio
-import fcntl
 import logging
 import math
 import os
@@ -261,6 +260,7 @@ def _hci_dev_info(dev_id: int) -> Optional[dict]:
     """
     if not sys.platform.startswith('linux'):
         return None
+    import fcntl
     if not hasattr(socket, 'AF_BLUETOOTH'):
         socket.AF_BLUETOOTH = 31  # type: ignore[attr-defined]
     if not hasattr(socket, 'BTPROTO_HCI'):
@@ -370,21 +370,73 @@ def bt_power(on):
         logging.error('Failed to power controllers via bluetoothctl: %s', e)
 
 
+# Deliberately *not* named _MAC_RE: that name is already taken above for the
+# adapter check, which accepts only the colon form. Reusing it here silently
+# rebound the module global, so `normalize_adapter()` started accepting
+# hyphen-separated (and mixed-separator) controller MACs as a side effect.
+_BLE_MAC_RE = re.compile(r'^([0-9A-Fa-f]{2}[:-]){5}[0-9A-Fa-f]{2}$')
+
+
+def normalize_ble_address(address):
+    """Canonicalize a BLE MAC to the uppercase colon form the BLE stacks index by.
+
+    habluetooth (the ESPHome proxy path) stores advertisements in plain dicts
+    keyed by whatever string the scanner reported and looks them up with a bare
+    `dict.get(address)` -- there is no normalization anywhere in it. Proxy
+    addresses come from bluetooth-data-tools' `f"{addr:012X}"`, i.e. UPPERCASE,
+    so a lowercase MAC in the add-on config misses every lookup:
+    `async_scanner_devices_by_address()` finds no connection path (which surfaces
+    as the misleading "No backend with an available connection slot ...") and
+    `async_ble_device_from_address()` returns None (BleakDeviceNotFoundError).
+    Meanwhile our own bt_diagnostics compares case-insensitively and happily
+    reports the device as in range, so it reads like a proxy or slot problem
+    rather than a config typo (#399).
+
+    Only MAC-shaped addresses are touched. macOS/CoreBluetooth identifiers are
+    UUIDs and `serial` is not an address at all; both are returned unchanged.
+    """
+    if not isinstance(address, str) or not _BLE_MAC_RE.match(address.strip()):
+        return address
+    return address.strip().replace('-', ':').upper()
+
+
+# tearing down a stale link happens under the process-wide ConnectLock, see
+# BtBms._force_disconnect()
+FORCE_DISCONNECT_TIMEOUT = 10.0
+
+
 class BtBms:
     shutdown = False
 
     def __init__(self, address: str, name: str, keep_alive=False, psk=None, adapter=None, verbose_log=False,
                  _uses_pin=False):
-        self.address = address
+        self.address = normalize_ble_address(address)
+        # The address exactly as configured, before canonicalization. ONLY for
+        # keeping an identity that was already derived from the old spelling
+        # stable across the #399 upgrade -- see bmslib.sinks.telemetry_address().
+        # Never scan, connect or look anything up with this: on the proxy stack a
+        # non-canonical spelling matches nothing, which is the bug #399 fixed.
+        self.address_raw = address
         self.name = name
         self.keep_alive = keep_alive
         self.verbose_log = verbose_log
         self.logger = get_logger(verbose_log)
+        if self.address != address:
+            # Not cosmetic: see normalize_ble_address(). Say it out loud so the
+            # config and the log agree on one spelling of the address.
+            self.logger.info('%s: using address %s (normalized from %r)',
+                             name, self.address, address)
 
         self._fetch_futures = FuturesPool()
         self._psk = psk
         self._connect_time = 0
         self._pending_disconnect_call = False
+
+        # connect() does more than open the link: it discovers characteristics,
+        # subscribes and reads one-shot device state. When it raises half-way the
+        # link is up but the BMS is not initialized, so is_connected on its own
+        # must not be read as "ready to sample" (#391).
+        self._connect_complete = False
 
         # runtime (seconds-to-empty) estimation state, see estimate_runtime()
         self._runtime_current_ewma = EWMA(span=6)
@@ -423,7 +475,10 @@ class BtBms:
                     adapter, baudrate=getattr(self, 'BAUDRATE', 115200),
                     **getattr(self, 'SERIAL_KWARGS', {}))
             else:
-                self.client = self._create_client(address)
+                # self.address, not address: habluetooth looks the address up as a
+                # plain dict key and proxies report it upper-case, so handing the
+                # client the raw config spelling would undo the normalization (#399)
+                self.client = self._create_client(self.address)
 
             self._in_disconnect = False
 
@@ -440,7 +495,13 @@ class BtBms:
     def _create_client(self, addr_or_device):
         kwargs = {}
         adapter = self._adapter
-        if adapter:  # hci0, hci1 (BT adapter hardware)
+        if adapter and scanner_is_proxy():
+            # habluetooth picks the connection path itself, so `adapter:` neither
+            # selects a proxy nor a local controller. Saying we use it was how the
+            # reporter of #391 concluded their two BMS were on two proxies.
+            self.logger.debug('ignoring adapter %s for %s (%s): the esphome-proxy stack picks '
+                              'the connection path', adapter, self.address, self.name)
+        elif adapter:  # hci0, hci1 (BT adapter hardware)
             self.logger.info('Using adapter %s to connect to %s (%s)', adapter, self.address, self.name)
             kwargs['adapter'] = adapter
         return BleakClient(addr_or_device,
@@ -518,6 +579,8 @@ class BtBms:
 
         if self._connect_time:
             self._connect_time = 0
+
+        self._connect_complete = False
 
         if self.is_connected:
             self.logger.warning("%s _on_disconnect but is_connected=True")
@@ -629,7 +692,10 @@ class BtBms:
             try:
                 discovered = set(b.address for b in scanner.discovered_devices)
                 ad = f' using adapter {self._adapter}' if self._adapter else ''
-                if self.address not in discovered:
+                # Case-insensitive: backends disagree on MAC case (the ESPHome
+                # proxy reports uppercase), and an exact membership test here
+                # would reject a device that is plainly in range (#399).
+                if self.address.upper() not in {d.upper() for d in discovered}:
                     raise BleakDeviceNotFoundError(
                         self.address, 'Device %s%s not discovered. Make sure it in range and is not being '
                                       'accessed by another app. (found %s)' % (
@@ -651,10 +717,46 @@ class BtBms:
         await scanner.stop()
 
     async def disconnect(self):
+        self._connect_complete = False
         self._in_disconnect = True
         await self.client.disconnect()
         self._in_disconnect = False
         self._fetch_futures.clear()
+
+    async def force_disconnect(self):
+        """Public teardown for callers outside the connect flow (e.g. the sampler's
+        periodic reconnect). Call under ConnectLock; see _force_disconnect()."""
+        await self._force_disconnect()
+
+    async def _force_disconnect(self, timeout=FORCE_DISCONNECT_TIMEOUT):
+        """Tear the link down whatever the model's disconnect() does.
+
+        Model overrides clean up before delegating — JK calls stop_notify() first
+        (jikong.py) and HaBleakClientWrapper.stop_notify() is known to raise
+        non-BleakError exceptions when its backend is gone (ant.py). An exception
+        there means the link is still up, and a caller that then "reconnects" gets
+        a client habluetooth considers already connected: connect() returns at once
+        and the model stays as broken as before. So close the client directly if the
+        override did not get that far.
+
+        Bounded, because this runs under the process-wide ConnectLock: a proxy
+        teardown that never returns would stall every other BMS behind it (#391).
+        """
+        try:
+            await asyncio.wait_for(self.disconnect(), timeout)
+        except Exception as e:
+            self.logger.debug('%s disconnect() failed (%s), closing the client directly',
+                              self.name, str(e) or type(e).__name__)
+
+        if self.is_connected:
+            try:
+                await asyncio.wait_for(self.client.disconnect(), timeout)
+            except Exception as e:
+                self.logger.warning('%s could not close the stale link: %s',
+                                    self.name, str(e) or type(e).__name__)
+
+        # disconnect() clears this, but it may have raised before getting there
+        self._connect_complete = False
 
     async def fetch_device_info(self) -> DeviceInfo:
         """
@@ -755,15 +857,33 @@ class BtBms:
         """
         raise NotImplementedError()
 
+    async def set_soc(self, soc: float):
+        """
+        Overwrite the BMS' state-of-charge gauge (percent). Only some BMS support this.
+        """
+        raise NotImplementedError()
+
+    def supports_set_soc(self) -> bool:
+        return type(self).set_soc is not BtBms.set_soc
+
     def __str__(self):
         return f'{self.__class__.__name__}({self.address},{self.name})'
 
     async def __aenter__(self):
         # print("enter")
-        if self.keep_alive and self.is_connected:
+        if self.keep_alive and self.is_connected and self._connect_complete:
             return
         async with ConnectLock:
+            if self.is_connected and not self._connect_complete:
+                # the link survived a connect() that raised before finishing, so the
+                # BMS is missing whatever the rest of connect() would have set up.
+                # Nothing repairs that later, and keep_alive would hold the broken
+                # link forever: drop it and start over (#391).
+                self.logger.warning('%s reconnecting: previous connect did not complete', self.name)
+                await self._force_disconnect()
+            self._connect_complete = False
             await self.connect()
+            self._connect_complete = True
 
     async def __aexit__(self, *args):
         # print("exit")

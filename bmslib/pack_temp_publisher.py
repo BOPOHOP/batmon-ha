@@ -15,11 +15,57 @@ sampler's main loop only sees one method call.
 import math
 from typing import Optional, TYPE_CHECKING
 
-from bmslib.pack_temp_rc import PackTempRCEstimator
+from bmslib.pack_temp_rc import PackTempRCEstimator, _valid
 from bmslib.ambient_cache import AmbientCache
 
 if TYPE_CHECKING:
     from bmslib.bms import BmsSample
+
+
+# Options (flat, like every other key in config.yaml):
+#   pack_temp_estimator: true
+#   pack_temp_room_topic: "<MQTT state topic of a room temperature>"
+#   pack_temp_outdoor_topic: "<MQTT state topic of an outdoor temperature>"
+#   pack_temp_ambient_max_age: 600   # s; an older ambient reading counts as missing
+AMBIENT_MAX_AGE_DEFAULT_S = 600.0
+AMBIENT_CHANNEL_KEYS = (("room", "pack_temp_room_topic"), ("outdoor", "pack_temp_outdoor_topic"))
+
+
+def ambient_cache_from_config(conf, register_topic, log=None) -> Optional[AmbientCache]:
+    """The shared AmbientCache when `pack_temp_estimator` is on, else None.
+
+    Registers one state topic per configured ambient channel through
+    `register_topic(topic, callback)`. A channel without a topic stays empty:
+    the estimator then runs on what it has (MOS alone at worst) and never
+    receives a made-up ambient value."""
+    if not conf.get("pack_temp_estimator"):
+        return None
+    try:
+        max_age = float(conf.get("pack_temp_ambient_max_age") or AMBIENT_MAX_AGE_DEFAULT_S)
+    except (TypeError, ValueError):
+        max_age = math.nan
+    if not (math.isfinite(max_age) and max_age > 0):
+        if log:
+            log.warning("pack_temp_ambient_max_age=%r is not a positive number, using %.0f s",
+                        conf.get("pack_temp_ambient_max_age"), AMBIENT_MAX_AGE_DEFAULT_S)
+        max_age = AMBIENT_MAX_AGE_DEFAULT_S
+    cache = AmbientCache(max_age_s=max_age)
+    for channel, key in AMBIENT_CHANNEL_KEYS:
+        topic = (conf.get(key) or "").strip()
+        if '+' in topic or '#' in topic:
+            # one channel is one sensor; a wildcard would mix several into it
+            # (and the exact-topic dispatch would never match it anyway)
+            if log:
+                log.warning("pack temp estimator: %s=%r contains an MQTT wildcard; set the exact state topic "
+                            "of one temperature sensor. Running without %s ambient.", key, topic, channel)
+            continue
+        if topic:
+            register_topic(topic, cache.topic_callback(channel))
+            if log:
+                log.info("pack temp estimator: %s ambient from MQTT %s (max age %.0f s)", channel, topic, max_age)
+        elif log:
+            log.info("pack temp estimator: no %s ambient topic (%s), running without it", channel, key)
+    return cache
 
 
 class PackTempRCPublisher:
@@ -50,9 +96,13 @@ class PackTempRCPublisher:
     def update_from_sample(self, sample: "BmsSample") -> Optional[float]:
         """Advance the estimator with this sample's MOS temp + current ambients,
         publish the result, return the estimate. Returns None and skips publish
-        if MOS temp is missing (the estimator's hard requirement)."""
+        if the MOS temp is missing or implausible (the estimator's hard
+        requirement)."""
         mos = sample.mos_temperature
-        if mos is None or (isinstance(mos, float) and math.isnan(mos)):
+        if not _valid(mos):
+            # missing, NaN or out of range (a 1648 C glitch): the estimator
+            # would not advance and hand back its previous state, which must
+            # not be published -- or tagged -- as a new estimate
             return None
         room = self.ambient.get(self.room_channel)
         outdoor = self.ambient.get(self.outdoor_channel)
@@ -65,7 +115,7 @@ class PackTempRCPublisher:
         self.publish_fn(topic, f"{t_est:.2f}")
         return t_est
 
-    def hass_discovery_payload(self, expire_after_seconds: int) -> dict:
+    def hass_discovery_payload(self, expire_after_seconds: int) -> tuple:
         """Returns the (topic, payload) HA-discovery entry to publish once on
         startup. Mirrors the pattern in mqtt_util.publish_hass_discovery."""
         node_id = self.device_topic.replace('/', '_')

@@ -21,6 +21,7 @@ the addon can fall back to plain bleak rather than crash.
 
 from __future__ import annotations
 
+import inspect
 import logging
 from typing import Any, Iterable, List
 
@@ -58,7 +59,25 @@ def install_bleak_shim() -> bool:
     bleak.BleakClient = HaBleakClientWrapper  # type: ignore[assignment]
     bleak.BleakScanner = HaBleakScannerWrapper  # type: ignore[assignment]
 
-    _manager = BluetoothManager()
+    class _Manager(BluetoothManager):
+        """Only exists to answer habluetooth's subclass hook.
+
+        `BluetoothManager.__init__` warns "does not implement
+        _discover_service_info, subclasses must implement this method to consume
+        discovery data" whenever that method is still the base one -- which it is
+        if you instantiate BluetoothManager directly, as we did. The hook is an
+        optional per-advertisement callback for consumers that react to
+        discoveries (Home Assistant's integration matching); batmon polls a
+        configured address instead, so there is genuinely nothing to consume and
+        the advertisement history the connect path uses is kept regardless.
+        Overriding it with a no-op silences a line that read like a fault on
+        every start-up (#399).
+        """
+
+        def _discover_service_info(self, service_info) -> None:
+            pass
+
+    _manager = _Manager()
     set_manager(_manager)
     logger.info(
         "esphome_proxy: bleak shim installed (BleakClient/BleakScanner -> "
@@ -142,6 +161,9 @@ async def stop_proxies() -> None:
     _conns.clear()
     if _manager is not None:
         try:
-            await _manager.async_stop()
+            # habluetooth names it async_stop() but it is a plain function (6.1 and 6.26)
+            r = _manager.async_stop()
+            if inspect.isawaitable(r):
+                await r
         except Exception:
             pass

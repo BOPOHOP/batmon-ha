@@ -130,11 +130,13 @@ class DalyUart(DalyBt):
     # with timeout=None parks the reader thread forever and every command times
     # out with "got 0/N responses" (#398). feed_buffer() below does the framing.
     SERIAL_KWARGS = dict(eol=None, timeout=1)
-    # Gap inserted before every request. A poll sends ~5 commands back to back;
-    # without a pause Daly's firmware UART is still busy with the previous reply
+    # Gap inserted before every request, taken while holding the bus (see _q).
+    # Without a pause Daly's firmware UART is still busy with the previous reply
     # and simply drops the next request. dbus-serialbattery uses the same 20 ms
     # for the same reason ("else the Daly is not ready and throws a lot of no
-    # reply errors"). At the default 1 s polling period this costs ~100 ms.
+    # reply errors"). A poll sends 2 commands in steady state (0x90 soc, 0x95
+    # voltages) and 4 on the cycles where the 30 s status/temperature caches
+    # refresh, so this costs 40-80 ms per BMS per poll.
     # We deliberately do NOT flush the input buffer as it does: our reader thread
     # owns the port, so flushing from the event loop would race with it, and
     # feed_buffer() already resyncs on the 0xA5 header.
@@ -160,10 +162,28 @@ class DalyUart(DalyBt):
                                     addr_byte=daly_board_addr_byte(self.board),
                                     fill=UART_FILL)
 
-    async def _q(self, command: int, num_responses: int = 1):
+    async def _settle(self):
         if self.REQUEST_SETTLE:
             await asyncio.sleep(self.REQUEST_SETTLE)
-        return await super()._q(command, num_responses)
+
+    async def _q(self, command: int, num_responses: int = 1):
+        # RS485 is half duplex and the bus may carry several BMS. Hold it for the
+        # whole request/response exchange, or with concurrent_sampling two units
+        # transmit at once and both replies are lost.
+        lock = getattr(self.client, 'bus_lock', None)
+        if lock is None:
+            await self._settle()
+            return await super()._q(command, num_responses)
+        async with lock():
+            # The settle has to happen INSIDE the critical section. Sleeping
+            # before taking the lock lets a queued BMS burn its gap while another
+            # unit is still mid-exchange, so it transmits the instant the lock
+            # frees -- no gap at all after the previous reply, which is exactly
+            # what the settle exists to prevent. Invisible with one BMS; it only
+            # bites with several units on one bus, which is the case that needs
+            # it most (#398).
+            await self._settle()
+            return await super()._q(command, num_responses)
 
     def _q_timeout_context(self) -> str:
         # A dead reader thread has to be reported FIRST. Its death freezes
@@ -196,23 +216,43 @@ class DalyUart(DalyBt):
 
     def _wrap_notify(self, sender, data):
         """Re-buffer chunked serial data into 13-byte frames before handing
-        off to ``DalyBt._notification_callback`` (which assumes aligned
-        frames)."""
+        off to ``DalyBt._notification_callback`` (which assumes aligned frames).
+
+        Byte 1 of a reply is the board number that answered. What to do with a
+        frame from another board depends on who else is on the wire:
+
+        * shared bus -- it belongs to a sibling BMS, which is reading the same
+          byte stream and will decode it itself. Drop it silently; decoding it
+          here would attribute another battery's voltages to this one.
+        * port to ourselves -- keep it, and say so once. This is the "wrong
+          board number configured" case, and accepting the frame is what makes
+          the add-on usable while the user fixes the config.
+        """
         frames = feed_buffer(self._uart_buf, bytes(data), self._uart_stats)
-        if frames:
-            # Byte 1 of a reply is the board number that answered. We still
-            # accept the frame (one BMS per port today), but a mismatch is worth
-            # saying out loud: it is exactly the "wrong board number configured"
-            # case, and it would otherwise look like a working setup.
-            for i in range(0, len(frames), RESP_LEN):
-                replier = frames[i + 1]
-                if replier != self.board and not self._board_mismatch_warned:
-                    self._board_mismatch_warned = True
-                    self.logger.warning(
-                        '%s addressed Daly board %d but board %d answered — set '
-                        '`type: daly_uart:%d` to address it explicitly',
-                        self.name, self.board, replier, replier)
-            self._notification_callback(sender, frames)
+        if not frames:
+            return
+
+        shared = getattr(self.client, 'shared', False)
+        mine = bytearray()
+        for i in range(0, len(frames), RESP_LEN):
+            frame = frames[i:i + RESP_LEN]
+            replier = frame[1]
+            if replier == self.board:
+                mine.extend(frame)
+                continue
+            if shared:
+                self._uart_stats['other_board'] = self._uart_stats.get('other_board', 0) + 1
+                continue
+            if not self._board_mismatch_warned:
+                self._board_mismatch_warned = True
+                self.logger.warning(
+                    '%s addressed Daly board %d but board %d answered — set '
+                    '`type: daly_uart:%d` to address it explicitly',
+                    self.name, self.board, replier, replier)
+            mine.extend(frame)
+
+        if mine:
+            self._notification_callback(sender, bytes(mine))
 
     async def connect(self, timeout=10, **kwargs):
         # Open the serial wrapper (BtBms.__init__ already created the
@@ -225,7 +265,12 @@ class DalyUart(DalyBt):
         self._uart_buf.clear()
         self._uart_stats.clear()
         from bmslib.wired import SerialCharStub
-        char = SerialCharStub("daly-uart", "notify")
+        # The stub uuid is the bus-wide identity of this BMS (SerialCharStub has
+        # value-based equality). Include the board number so several Daly can
+        # share one RS485 port without overwriting each other's callback -- and
+        # so two units configured with the SAME board number are rejected as the
+        # duplicate they are, rather than silently stealing each other's replies.
+        char = SerialCharStub("daly-uart-%d" % self.board, "notify")
         await self.client.start_notify(char, self._wrap_notify)
         # Mark a sentinel UUID so DalyBt.disconnect() can stop_notify.
         self.UUID_RX = char

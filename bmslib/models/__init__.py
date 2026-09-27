@@ -31,6 +31,7 @@ def get_bms_model_class(name: str):
         import bmslib.models.supervolt
         import bmslib.models.victron
         import bmslib.models.litime
+        import bmslib.models.bm6
 
     bms_registry = dict(
         daly='models.daly.DalyBt',
@@ -41,19 +42,27 @@ def get_bms_model_class(name: str):
         jk_32s='models.jikong.JKBt_32s',
         jk_uart='models.jikong_uart.JKUart',  # RS485/UART TLV protocol; use with address=serial
         daly_uart='models.daly_uart.DalyUart',  # RS485/USB-UART; same A5/04 frames as BLE
+        jbd_uart='models.jbd_uart.JbdUart',  # JBD over TTL UART / RS485; same DD..77 frames as BLE
+        jk_pb_uart='models.jk_pb_uart.JkPbUart',  # JK-PB inverter BMS over RS485 (Modbus trigger, JK02_32S frame)
+        seplos_uart='models.seplos_uart.SeplosUart',  # Seplos V2 ASCII protocol over RS485
+        braunpwr_uart='models.braunpwr_uart.BraunPwrUart',  # BraunPWR / KS48100 rack BMS, YD/T 1363 over UART (#403)
+        renogy_uart='models.renogy_uart.RenogyUart',  # Renogy smart lithium over RS485 Modbus RTU
         pace_uart='models.pace.PaceUart',  # PACE "paceic" RS232/RS485 ASCII protocol (#276)
         ant='models.ant.AntBt',
         victron='models.victron.SmartShuntBt',
         group_parallel='bmslib.group.VirtualGroupBms',
-        # group_serial=bmslib.group.VirtualGroupBms, # TODO
+        group_serial='bmslib.group.SeriesGroupBms',
         supervolt='models.supervolt.SuperVoltBt',
         sok_legacy='models.sok.SokBt',  # pre-2023 SOK/ABC firmware; `sok` -> aiobmsble abc_bms (see alias above)
         litime='models.litime.LitimeBt',
+        bm6='models.bm6.Bm6Bt',  # BM6/BM2-style AES-encrypted 12 V car battery monitor (#160)
+        bm2='models.bm6.Bm2Bt',  # Quicklynks BM2 / Ancel BM200, other key, pushes frames unsolicited (#41)
         basen='models.basen.BasenBt',  # Basen BLE (0xFA00/01/02), ported from syssi/esphome-basen-bms
         basen_uart='models.basen_uart.BasenUart',  # Basen RS232/RS485 (paceic-unrelated), ported from GHswitt/esphome-basen
         noname_modbus='models.noname_modbus.NoNameModbusBt',  # generic Modbus-RTU-over-NUS
         dummy='models.dummy.DummyBt',
         snoop='models.snoop.SnoopBt',  # GATT dumper for reverse-engineering new BMS
+        offgridtec='models.offgridtec.OffgridtecBt',
     )
 
     mod_class = bms_registry.get(name)

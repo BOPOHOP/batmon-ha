@@ -1,3 +1,76 @@
+## [unreleased]
+
+* Experimental `impedance_estimator` (off by default): estimates the per-cell resistance of LiFePO4 packs from sampled current and cell voltages and publishes it as a `Cell Resistance` sensor in mΩ; small packs may never draw the current steps it needs (doc/Cell Resistance.md).
+* Experimental `pack_temp_estimator` (off by default): a `Pack Temp (RC est.)` sensor estimating the cell temperature from the MOSFET temperature and optional room/outdoor MQTT topics, for BMSes that report only a MOSFET temperature.
+* New wired type `braunpwr_uart` for BraunPWR packs with the KS48100 rack BMS (YD/T 1363, `>…\r` frames, 9600 baud), whose FC41D WiFi/BLE module keeps dropping the BLE link. Built from a user's working ESPHome config and the manufacturer's protocol PDF; untested on hardware (#403).
+* Fix: telemetry uploaded either a device's pack samples or its cell voltages, rarely both, because the two shared one 15 s slot. Each now has its own.
+
+## [2.21]
+
+* New `ble_request_timeout`: how long an aiobmsble (`_ble`) device gets to answer one request, default 5 s over three attempts (doubled while the write mode is still unpinned). Raise it for a pack that times out in `_await_msg` while others share the adapter. Global, because aiobmsble holds it on its base class (#415).
+* `pin:` now works for the aiobmsble types (`felicity`, `daly_ble`, ...): it was silently dropped, so packs that only serve GATT to a bonded central never connected, like Felicity firmware that renames `F07…` to `SolarB_…`. The add-on now bonds through BlueZ itself (as `bluetoothctl pair` does), so no GATT connection is needed first (#415).
+* A syntax error in `options.json` now stops batmon with the file, the line, the column and the offending line quoted back, instead of being logged as a warning and followed by `No such file or directory: 'options.json'` — an error naming a file the user never wrote. A file that exists but does not parse aborts; batmon no longer falls back to the next path, which could silently run a configuration that was not the one edited. One missing comma made every option in the file inert, which is how #414 started.
+* `adapter:` at the top level of the configuration is no longer ignored in silence: it is now the default for every device that doesn't set its own (a controller like `hci1` or its MAC for BLE devices, an absolute port path like `/dev/ttyUSB0` for wired ones), and the log names the devices that inherited it. A value that reaches no device, or that is neither of those two things, is logged instead of looking like an adapter that was selected and then failed (#414).
+* Add `offgridtec` (legacy Offgridtec OGT-12200 / Topband): voltage, current, SOC, cycles, temperature, cell voltages and eight alarm bits from the unsolicited FFE4 ASCII-hex records. Decoder and fixtures contributed by @travel-and-cache from a capture of an OGT-12200-19H006 (#413).
+* Fix (`bm6`): the Battery Guard variant answers an empty `d155 07 ff …` sentinel unless the realtime request is written before FFE4 is subscribed. Such a device now switches to that ordering, and back again if it stops answering. Thanks @travel-and-cache (#412).
+* Android app for JK: `/jk.html` talks to a JK BMS directly from Chrome on Android over Web Bluetooth — no add-on, no MQTT, the phone is the BLE client. Shows pack values, per-cell voltages, temperatures and MOSFET states. Chrome needs a secure context for Bluetooth, so see doc/GUI.md for the three ways to get one. The decoder is a port of `bmslib/models/jikong.py`, held to it by a parity test that runs both against the same captured frames.
+* New built-in web GUI showing every pack, its BMS data and the topology of any groups. In Home Assistant it appears as an ingress panel in the sidebar; standalone it serves on `http://<host>:8099/`. Read-only for now. See doc/GUI.md, and doc/options.json.gui-demo to try it with simulated packs and no hardware.
+* New `type: group_serial` for battery strings wired in series, alongside the existing `group_parallel`. Voltage sums, current is the string current (mean of the members), power is derived from those aggregates, and charge/capacity/SOC/SOH come from the pack with the least remaining charge — the one that actually limits discharge, which is not always the lowest-SOC pack. See doc/Groups.md.
+* A group no longer publishes a partial sum. `BmsGroup.fetch()` aggregated whatever members had reported so far — only `fetch_voltages()` raised — so a group could emit plausible but wrong totals while a member was still connecting. It now waits for every member, which shows as a gap instead of a wrong number.
+* A group now reports its members' alarms. `sum_parallel()` dropped `problem` entirely, so a group device hid a failure any of its BMSes was flagging. Group devices gain a `problem` binary sensor; unknown stays unknown rather than becoming "no problem".
+* Fix: with `watchdog: true` and no MQTT broker configured, batmon killed itself a few minutes after start. The watchdog measures the time since the last MQTT publish, but `mqtt_single_out()` returns early when there is no client and never advances that time, so the check always tripped. It now only applies when a broker is configured, which matters for standalone setups.
+* Fix: the "move groups to the end" sort of the sampler list never took effect — its sort key closed over a leaked loop variable and was constant for every entry. A `group_parallel` could therefore be sampled before its members and waste the cycle raising `GroupNotReady`.
+
+* `bm6`/`bm2`: write the realtime request with `response=True` and subscribe to notifications through `BtBms.start_notify`, which clears an orphan subscription first. Thanks @travel-and-cache, who confirmed a BM6 / intAct Battery Guard reporting voltage, SOC and temperature on BlueZ 5.86 (#408, #160).
+* Fix (`ble_stack: bumble`): every aiobmsble BMS was skipped as `Unknown device type`, because the bundled `bleak_retry_connector` shim was missing `MAX_CONNECT_ATTEMPTS` and `close_stale_connections`, which aiobmsble >= 0.25 imports at module level. Same bug as #385 fixed for bluek; the bumble shim was never updated (#407).
+* `ble_stack: bluek`: a dropped BLE link now logs `link lost (…)` with the kernel's reason, e.g. `Connection timed out` when the BMS stopped answering over the air. It used to surface only as a later `TX BLE request error (BleakError)` plus `TimeoutError`, with no cause (#403).
+
+## [2.20]
+
+* New wired types: `jbd_uart` (JBD over UART/RS485), `jk_pb_uart` (JK-PB inverter BMS, RS485), `seplos_uart` (Seplos V2, RS485) and `renogy_uart` (Renogy smart lithium, Modbus RTU). Bus address via `type: <name>:<addr>`, several can share one port. Tested against reference frames only.
+* `set SOC` number entity to correct a drifted SOC gauge from HA. Daly: command 0x21 as dbus-serialbattery writes it. JK firmware >= 11: register 0x6E as esphome-jk-bms. Untested on hardware (#144).
+* Add `bm2` (Quicklynks BM2, Ancel BM200): voltage and SOC from the AES-encrypted pushed frames. Untested on hardware (#41).
+* Add `bm6` car battery monitor: voltage, temperature, SOC and charging/low-voltage state over its AES-encrypted protocol. Untested on hardware (#160).
+* JBD: newer firmware (Liontron etc.) only answers after passkey pairing; `pin:` now works for `type: jbd` (#217).
+* MQTT discovery: `state_class` on capacity, remaining charge, throughput and the meters, so HA keeps long-term statistics for them (#232).
+* MQTT: a refused login is reported once as `refused the connection: Not authorized` instead of endless `publish failed: 4` and a watchdog exit; the first sample waits for the CONNACK (#269).
+
+## [2.19]
+
+* JBD: report which cells the balancer is bleeding, as a `balancing` binary sensor and a `balancing cells` list (e.g. `1,5,18`), decoded from the balance status words of the basic-info frame (#283).
+* Fix (JBD): a basic-info frame whose NTC count byte overruns the payload is rejected instead of publishing hundreds of phantom -273 °C temperature sensors, which HA discovery then created as entities (#321).
+* `type: snoop`: add the `ej` probe family (E&J Technology `:`…`~` ASCII framing, incl. the Fogstar Drift app's poll) and fingerprint its replies (#351).
+* Telemetry: `doc/Telemetry.md` still claimed it was off by default, three releases after it went on by default in 1.96; the doc now states the default, lists exactly what is sent and how to opt out, and the add-on logs `Anonymous telemetry is ON` at startup. Uploads now go over HTTPS with certificate verification; if the TLS endpoint is unreachable at startup batmon falls back to the old plain-HTTP port and logs a warning, so a lapsed certificate never silences telemetry (#379).
+* Fix (JK): a status frame with a BLE notify packet dropped mid-way (a busy ESPHome proxy) passes the 8-bit sum checksum once in 256 and was decoded at shifted offsets, publishing values like 1,216,000 V, 107 kA and SOC 0% to HA. The framer now rejects a frame that contains the next frame's header, and the decoder rejects physically impossible cell/pack voltages, current, temperatures and SOC (#391).
+* `ble_stack: esphome`: a fresh 2.17 build failed every connect through ESPHome proxies (one path offered, then a timeout). The esphome venv was never "latest": a wheel workaround pinned `bluetooth-data-tools<1.29`, which silently held habluetooth at 6.1.0 from April while aioesphomeapi floated to 46.x. The four packages are now pinned as one current set (habluetooth 6.26.11, bleak-esphome 4.1.0, aioesphomeapi 46.3.0, bleak-retry-connector 4.7.0). Builds and imports verified; the connect failure itself awaits confirmation from the reporter (#401).
+* New optional `reconnect_interval_minutes`: drop each `keep_alive` BLE link every N minutes (jittered) so the next connect re-picks the backend/proxy. Habluetooth only scores proxies at connect time, so on a multi-proxy ESPHome setup a device otherwise stays on whichever proxy answered first. Wired BMS are left alone. Off by default (#406).
+* `concurrent_sampling`: a device that keeps failing now backs off up to 10 min (was 60 s), so its retries stop starving healthy neighbours on the same ESPHome proxy. Serial mode keeps 60 s, where a longer wait would stall every device (#405).
+* Fix: a BMS failing every cycle for ~5 days crashed its fetch loop with `OverflowError` from the `1.1 ** n` error backoff; the exponent is now clamped.
+
+## [2.18]
+
+* Fix (`ble_stack: bluek`): endless `[Errno 16] Resource busy: 'l2cap connect to …'`, reported as `device not found`. Something else on the host — usually bluetoothd for Home Assistant's own Bluetooth integration — held the device's ATT channel, which bluek cannot share and retrying never clears. bluek now drops that link before retrying, throttled per device and only where a connect was actually refused (#403).
+
+## [2.17]
+
+* Bundled aiobmsble updated 0.25.0 → 0.27.0. For Seplos v2 this fixes a permanent bogus `problem_code`: alarm bits the app files under "Alarm" (not "Problem") were read from the wrong frame and reported as a fault (#400, aiobmsble#98/#240). Also adds the `pwrboozt_bms` type and a TDT firmware-v1.1 current/charge fix.
+
+## [2.16]
+
+* Several Daly can share one RS485 bus and one USB adapter: point them at the same `adapter:` and give each a board number (`type: daly_uart:1`, `daly_uart:2`, …). Replies are routed by board number and requests serialized, so `concurrent_sampling` stays safe; duplicate board numbers, and two BMS families needing different baud rates on one port, are rejected instead of silently corrupting each other's readings (#398).
+* Fix: every reply on a wired BMS arrived a full command timeout late (12 s for Daly) whenever the event loop was otherwise idle — the serial reader thread resolved the pending future without waking the loop. Affects all wired models (`daly_uart`, `jk_uart`, `pace_uart`, `basen_uart`); BLE was never affected.
+* Fix: `daly_uart`'s 20 ms inter-command gap was taken before acquiring the bus, so with several units on one bus a queued BMS transmitted the instant the previous reply landed — no gap at all, which is what the gap exists to prevent (#398).
+* Serial reader threads now stop on shutdown instead of holding the port open.
+* Fix: a BMS whose connect was interrupted after the link came up stayed half-initialized for good, reporting `num_cells not set` and no cell voltages every cycle until restart — with `keep_alive` the surviving link counted as connected, so connect never ran again (#391).
+* Fix: a lower-case `address:` never connected through an ESPHome proxy. habluetooth looks addresses up as plain dict keys and a proxy always reports them upper-case, so it failed as `No backend with an available connection slot that can reach address …` on the native path and `BleakDeviceNotFoundError` on the `_ble`/aiobmsble one — neither of which names the real problem. BlueZ accepts either case, so only `ble_stack: esphome` was affected (#399).
+* Fix: canonicalizing the address broke a `group_parallel` whose members were referenced by lower-case MAC — the group could not find them and the add-on aborted at start-up instead of just the group failing. Members now match a name exactly or an address case-insensitively (#399).
+* Anonymous telemetry still hashes the address as written in the config, not the canonicalized form, so a device's telemetry identity does not move at this upgrade (#399).
+* With `ble_stack: esphome`, `adapter:` is no longer reported as if it were used — habluetooth picks a proxy per connection by signal strength — and start-up discovery scans once instead of printing the same device list per adapter (#391).
+* With `ble_stack: esphome`, start-up no longer prints `BluetoothManager: does not implement _discover_service_info …`. The hook is optional — batmon polls a configured address rather than reacting to discoveries — but the line read like a fault (#399).
+* New `bt_power_cycle_on_error` (off by default): toggles the Bluetooth controller off and on when reconnecting one BMS keeps failing, for hosts whose stack answers every connect with `Operation already in progress`. Rate-limited to one cycle per 10 minutes, and it drops all BLE connections including Home Assistant's own (#392).
+* `tdt_nocrc`: a TDT/XiaoXiang-style variant that accepts frames whose CRC the BMS firmware computes wrong, for devices that are otherwise unreadable. Shipping since 2.14 but never documented here. The "accepting frames with invalid CRC" warning is now logged once per device instead of once per connection, so it no longer repeats on every reconnect (#394).
+* Docs: Daly RS485 wiring that works (XH 5-pin: 1 = B−, 2 = A+, 3 = GND — GND is required), and a correction: on some Daly the UART port and the Bluetooth module share one UART, on others they run at the same time (#398).
+
 ## [2.15]
 
 * Fix: `daly_uart` addressed RS485 board 1 unconditionally, so a Daly whose board number was changed from the factory default answered nothing at all. Set it with `type: daly_uart:2` (#398).

@@ -70,6 +70,8 @@ class JbdBt(BtBms):
     TIMEOUT = 16
 
     def __init__(self, address, **kwargs):
+        # newer JBD firmware gates the protocol behind a passkey pairing (#217)
+        kwargs.setdefault('_uses_pin', True)
         super().__init__(address, **kwargs)
         self._buffer = bytearray()
         self._switches = None
@@ -136,6 +138,16 @@ class JbdBt(BtBms):
         num_cell = int.from_bytes(buf[21:22], 'big')
         num_temp = int.from_bytes(buf[22:23], 'big')
 
+        # The NTC count byte must fit the payload. A frame that passes the
+        # length and checksum check but declares more sensors than it carries
+        # would otherwise decode empty slices to -273.1 C and make HA discovery
+        # create one entity per phantom sensor (253 of them in #321).
+        if len(buf) < 23 + num_temp * 2:
+            raise ValueError(
+                f"JBD basic-info declares {num_temp} NTC sensors but payload has "
+                f"room for {(len(buf) - 23) // 2}"
+            )
+
         mos_byte = int.from_bytes(buf[20:21], 'big')
 
         # JBD protection-status bitmask (header-stripped offset 16:18). Bits
@@ -143,6 +155,10 @@ class JbdBt(BtBms):
         # NTC OT/UT, MOSFET errors, etc. We surface the raw code + a derived
         # "any alarm" boolean so HA can show a problem indicator.
         problem_code = int.from_bytes(buf[16:18], byteorder='big', signed=False)
+
+        # Balance status: bytes 12-13 cells 1-16, bytes 14-15 cells 17-32, one
+        # bit per cell, set while that cell is being bled (#283).
+        balancing_cells = int.from_bytes(buf[12:14], 'big') | (int.from_bytes(buf[14:16], 'big') << 16)
 
         current = -int.from_bytes(buf[2:4], byteorder='big', signed=True) / 100
         charge = int.from_bytes(buf[4:6], byteorder='big', signed=False) / 100
@@ -168,6 +184,7 @@ class JbdBt(BtBms):
             ),
 
             problem_code=problem_code,
+            balancing_cells=balancing_cells,
 
             # charge_enabled
             # discharge_enabled
@@ -178,7 +195,6 @@ class JbdBt(BtBms):
         # print(dict(num_cell=num_cell, num_temp=num_temp))
 
         # self.rawdat['P']=round(self.rawdat['Vbat']*self.rawdat['Ibat'], 1)
-        # self.rawdat['Bal'] = int.from_bytes(self.response[12:14], byteorder='big', signed=False)
 
         product_date = int.from_bytes(buf[10:12], byteorder='big', signed=True)
         # productDate = convertByteToUInt16(data1: data[14], data2: data[15])

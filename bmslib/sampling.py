@@ -1,4 +1,5 @@
 import asyncio
+import contextlib
 import math
 import random
 import re
@@ -16,8 +17,8 @@ from bmslib.algorithm import create_algorithm
 from bmslib.bms import DeviceInfo, BmsSample, MIN_VALUE_EXPIRY
 from bmslib.cache.mem import mem_cache_deco
 from bmslib.group import BmsGroup, GroupNotReady
-from bmslib.mqtt_util import publish_sample, publish_cell_voltages, publish_temperatures, publish_hass_discovery, \
-    subscribe_switches, mqtt_single_out
+from bmslib.mqtt_util import publish_sample, is_none_or_nan, publish_cell_voltages, publish_temperatures, publish_hass_discovery, \
+    subscribe_switches, subscribe_set_soc, mqtt_single_out, publish_cell_resistance
 from bmslib.pwmath import Integrator, DiffAbsSum, LHQ
 from bmslib.util import get_logger, summarize_exc
 
@@ -26,6 +27,70 @@ logger = get_logger(verbose=False)
 
 class SampleExpiredError(Exception):
     pass
+
+
+# bt_power_cycle_on_error (#392): all samplers share the host controller, so the
+# cycle is rate-limited process-wide - three wedged BMS must not cycle the radio
+# three times in a row. It also drops every *healthy* connection, which is why it
+# is opt-in and only reached after repeated reconnects of one BMS have failed.
+BT_POWER_CYCLE_MIN_INTERVAL = 600
+BT_POWER_CYCLE_SETTLE = 3  # seconds the controller stays down / gets to come back up
+_t_last_bt_power_cycle = 0.0
+
+
+async def bt_power_cycle(bms_name):
+    """Power the bluetooth controller(s) off and on, last-resort recovery for a
+    host stack that no longer completes connects (BlueZ answering every attempt
+    with 'Operation already in progress', #370).
+
+    Returns True if the cycle was *attempted*, False if it was rate-limited or
+    raised. It cannot promise the controller actually came back: bt_power() logs
+    and swallows bluetoothctl failures internally, so success here is not
+    observable from the return value.
+
+    Goes through bt_power() rather than hciconfig so the ble_stack guards apply:
+    with bumble the adapter is owned by bumble itself, and with esphome there is
+    no local adapter to cycle. bt_power shells out to bluetoothctl, so it runs in
+    a thread - other samplers share this loop.
+    """
+    global _t_last_bt_power_cycle
+    t_now = time.time()
+    dt = t_now - _t_last_bt_power_cycle
+    if _t_last_bt_power_cycle and dt < BT_POWER_CYCLE_MIN_INTERVAL:
+        logger.info('%s: skipping bt power cycle, last one was %.0fs ago (min %ds)',
+                    bms_name, dt, BT_POWER_CYCLE_MIN_INTERVAL)
+        return False
+
+    # claim the slot before the first await, so two samplers on one loop cannot
+    # interleave their way into two cycles
+    _t_last_bt_power_cycle = t_now
+    logger.warning('%s: still failing after repeated reconnects, power-cycling the '
+                   'bluetooth controller(s). This drops all BLE connections.', bms_name)
+    powered_off = False
+    try:
+        await asyncio.to_thread(bmslib.bt.bt_power, False)
+        powered_off = True
+        await asyncio.sleep(BT_POWER_CYCLE_SETTLE)  # settle before powering back up
+        await asyncio.to_thread(bmslib.bt.bt_power, True)
+        await asyncio.sleep(BT_POWER_CYCLE_SETTLE)
+    except asyncio.CancelledError:
+        # main.py cancels the pending fetch loops whenever one of them returns.
+        # Being cancelled between off and on would leave the radio down for good,
+        # so hand the power-on to a task that outlives this coroutine.
+        if powered_off:
+            logger.warning('bt power cycle cancelled while the controller was down, '
+                           'powering back up')
+            asyncio.ensure_future(asyncio.to_thread(bmslib.bt.bt_power, True))
+        raise
+    except Exception as e:
+        logger.error('bt power cycle failed: %s', str(e) or type(e).__name__)
+        if powered_off:
+            with contextlib.suppress(Exception):
+                await asyncio.to_thread(bmslib.bt.bt_power, True)
+        return False
+
+    logger.info('bt power cycle attempted (bluetoothctl does not report success)')
+    return True
 
 
 class PeriodicBoolSignal:
@@ -57,6 +122,11 @@ class PeriodicBoolSignal:
 class BmsSampleSink:
     """ Interface of an arbitrary data sink of battery samples """
 
+    # Whether this sink needs cell voltages on every sample, or is happy to
+    # receive whatever the sampler already fetched. Existing sinks keep today's
+    # behaviour; the GUI sets it False so enabling the GUI adds no BLE traffic.
+    wants_voltages_every_sample = True
+
     def publish_sample(self, bms_name: str, sample: BmsSample, tags=None):
         raise NotImplementedError()
 
@@ -84,7 +154,11 @@ class BmsSampler:
                  algorithms: Optional[list] = None,
                  current_calibration_factor=1.0,
                  over_power=None,
-                 bms_group: Optional[BmsGroup] = None
+                 bms_group: Optional[BmsGroup] = None,
+                 bt_power_cycle_on_error=False,
+                 reconnect_interval_s: Optional[float] = None,
+                 impedance_estimator=False,
+                 ambient_cache=None,
                  ):
 
         self.bms = bms
@@ -99,6 +173,8 @@ class BmsSampler:
         self.over_power = over_power or math.nan
 
         self.sinks = sinks or []
+        self._last_error = None
+        self._last_error_type = None
 
         self.downsampler = Downsampler()
 
@@ -114,8 +190,21 @@ class BmsSampler:
 
         self._num_errors = 0
         self._num_not_found = 0  # consecutive device-not-found, drives the retry backoff
+        self._num_error_disconnects = 0  # consecutive error-forced reconnects, drives the power cycle
         self._time_next_retry = 0
         self._last_diag_t = 0
+        self.bt_power_cycle_on_error = bt_power_cycle_on_error
+
+        # Periodic reconnect (reconnect_interval_minutes, off by default). With
+        # keep_alive a BMS stays on whichever backend/proxy it first connected
+        # through: habluetooth only scores backends inside connect(). On a
+        # multi-proxy esphome setup that first pick is often not the best one, so
+        # optionally drop the link now and then to let connect() choose again.
+        # Jittered +/-20% and re-rolled per connect, so a fleet that connected
+        # in the same startup window does not reconnect in one burst every cycle.
+        self._reconnect_interval_s = reconnect_interval_s if reconnect_interval_s and reconnect_interval_s > 0 else None
+        self._t_connected = 0.0
+        self._reconnect_due_s = math.inf
 
         self.algorithm = None
         if algorithms:
@@ -143,9 +232,69 @@ class BmsSampler:
 
         # self.power_stats = EWM(span=120, std_regularisation=0.1)
 
+        # Experimental cell-resistance estimator (impedance_estimator, off by
+        # default). Only for real packs: a group's current and cell list are
+        # aggregates of its members, which are estimated on their own.
+        self.impedance = None
+        if impedance_estimator and not bms.is_virtual:
+            from bmslib.impedance import CellResistanceEstimator
+            self.impedance = CellResistanceEstimator(bms.name)
+            logger.info('%s: cell resistance estimator enabled (experimental)', bms.name)
+
+        # pack_temp_estimator (off by default): one RC estimator per real pack,
+        # all sharing the ambient cache. Runs without MQTT too (mqtt_single_out
+        # ignores a None client), so the impedance windows still get the tag.
+        self._pack_temp_publisher = None
+        self._pack_temp = None  # this iteration's estimate, None when it had no MOS reading
+        if ambient_cache is not None and not bms.is_virtual:
+            from functools import partial
+            from bmslib.pack_temp_publisher import PackTempRCPublisher
+            self._pack_temp_publisher = PackTempRCPublisher(
+                device_topic=self.mqtt_topic_prefix, ambient=ambient_cache,
+                publish_fn=partial(mqtt_single_out, mqtt_client))
+
         temp_step = getattr(bms, 'TEMPERATURE_STEP', 0)
         temp_smooth = getattr(bms, 'TEMPERATURE_SMOOTH', 10)
         self._lhq_temp = defaultdict(lambda: LHQ(span=temp_smooth, inp_q=temp_step)) if temp_step else None
+
+    def _arm_periodic_reconnect(self):
+        self._t_connected = time.monotonic()  # immune to wall-clock steps, like estimate_runtime
+        if self._reconnect_interval_s:
+            self._reconnect_due_s = self._reconnect_interval_s * random.uniform(0.8, 1.2)
+
+    async def _periodic_reconnect(self):
+        """Drop a healthy keep_alive link once its jittered interval elapsed."""
+        bms = self.bms
+        if not self._reconnect_interval_s or bms.is_virtual or not bms.is_connected:
+            return
+        if bms.address == 'serial':
+            return  # wired: nothing to re-pick
+        age = time.monotonic() - self._t_connected
+        if age < self._reconnect_due_s:
+            return
+        logger.info('%s periodic reconnect after %.0f s', bms.name, age)
+        self._reconnect_due_s = math.inf  # once per connect, even if the teardown fails
+        async with bmslib.bt.ConnectLock:
+            await bms.force_disconnect()
+
+    def status(self) -> dict:
+        """Read-only health for the GUI, so it never reaches into privates."""
+        try:
+            dd = self.bms.debug_data()
+        except Exception:
+            dd = None
+        return dict(
+            connected=self.bms.is_connected,
+            num_samples=self.num_samples,
+            num_errors=self._num_errors,
+            t_next_retry=self._time_next_retry,
+            last_error=self._last_error,
+            last_error_type=self._last_error_type,
+            device_info=self.device_info,
+            is_virtual=self.bms.is_virtual,
+            debug_data=dd,
+            expire_after=self.expire_after_seconds,
+        )
 
     def get_meter_state(self):
         return {meter.name: dict(reading=meter.get()) for meter in self.meters}
@@ -158,7 +307,10 @@ class BmsSampler:
             s = await self._sample_inner()
             if s:
                 self._num_errors = 0
+                self._last_error = None
+                self._last_error_type = None
                 self._num_not_found = 0
+                self._num_error_disconnects = 0
             return s
         except (bmslib.bt.BleakDeviceNotFoundError, bmslib.bt.BleakNotFoundError) as e:
             # back off on the number of failed *connects*, not on _num_errors: the latter
@@ -176,6 +328,8 @@ class BmsSampler:
             return None
 
         except GroupNotReady as e:
+            self._last_error_type = 'GroupNotReady'
+            self._last_error = str(e)
             log_data = (t_now - self._last_time_log) >= (60 if self.num_samples < 1000 else 300) or self.bms.verbose_log
             if log_data:
                 self._last_time_log = t_now
@@ -183,6 +337,8 @@ class BmsSampler:
             return None
 
         except Exception as ex:
+            self._last_error_type = type(ex).__name__
+            self._last_error = summarize_exc(ex) if 'summarize_exc' in globals() else str(ex)
             # Collapse the multi-page asyncio.wait_for traceback that masks the
             # real cause for connect/notify timeouts (see #367, #324). Full
             # exc_info kept for unexpected types where the trace is informative.
@@ -222,10 +378,29 @@ class BmsSampler:
                 logger.warning('%s disconnect because no data has been flowing for some time', bms.name)
                 await bms.disconnect()
 
-            if bms.is_connected and self._num_errors > 20:
-                logger.warning("disconnecting %s due to too many errors %d", bms, self._num_errors)
-                await bms.disconnect()
+            if self._num_errors > 20:
+                # One saturation round: drop the link if there is one, and count it
+                # either way. Keying the count on is_connected made the escalation
+                # below unreachable in the case it exists for - a host that answers
+                # every connect with 'Operation already in progress' never gets the
+                # link up, so is_connected stays False forever (#392).
+                if bms.is_connected:
+                    logger.warning("disconnecting %s due to too many errors %d", bms, self._num_errors)
+                    await bms.disconnect()
                 self._num_errors = 0
+                self._num_error_disconnects += 1
+
+            # Two saturation rounds (~42 cycles) with no sample in between, on a
+            # BLE error rather than a downstream one, so it is not this battery
+            # having a bad minute. Optionally cycle the controller (#392). Absent
+            # devices cannot get here - BleakDeviceNotFoundError returns through
+            # its own backoff above - and any good sample resets the count, so a
+            # BMS that recovers never escalates.
+            if (self._num_error_disconnects >= 2 and self.bt_power_cycle_on_error
+                    and isinstance(ex, short_trace_types)
+                    and not bms.is_virtual and bms.address != 'serial'):
+                if await bt_power_cycle(bms.name):
+                    self._num_error_disconnects = 0  # keep the history if it was skipped
 
             raise
 
@@ -244,6 +419,8 @@ class BmsSampler:
     async def _sample_inner(self):
         bms = self.bms
         mqtt_client = self.mqtt_client
+
+        await self._periodic_reconnect()
 
         was_connected = bms.is_connected
 
@@ -270,6 +447,10 @@ class BmsSampler:
 
             if not was_connected:
                 logger.info('connected bms %s!', bms)
+            if math.isinf(self._reconnect_due_s):
+                # (re)arm on any fresh link, including one __aenter__ repaired after a
+                # connect that raised half-way (was_connected was True then, #391)
+                self._arm_periodic_reconnect()
 
             if self.device_info is None and self.num_samples == 0:
                 # try to fetch device info first. if bms.fetch() fails we might have at least some details
@@ -306,9 +487,21 @@ class BmsSampler:
             if not math.isnan(sample.mos_temperature) and self._lhq_temp is not None:
                 sample.mos_temperature = self._lhq_temp['mos'].add(sample.mos_temperature)
 
+            if self._pack_temp_publisher is not None:
+                try:
+                    self._pack_temp = self._pack_temp_publisher.update_from_sample(sample)
+                except Exception as e:
+                    self._pack_temp = None
+                    logger.error('%s pack temp estimator: %s', bms.name, summarize_exc(e))
+
             if self.bms_group:
                 # update before invert current
                 self.bms_group.update(bms, sample)
+
+            # BmsSample sign (discharge > 0) after calibration, before the
+            # user's display preference flips it: the impedance fit needs a
+            # sign that does not depend on invert_current.
+            current_native = sample.current
 
             if self.invert_current:
                 sample = sample.invert_current()
@@ -361,6 +554,8 @@ class BmsSampler:
                 logger.info("%s subscribing for %s switch change", bms.name, sample.switches)
                 subscribe_switches(mqtt_client, device_topic=self.mqtt_topic_prefix, bms=bms,
                                    switches=sample.switches.keys())
+            if self.num_samples == 0 and mqtt_client and getattr(bms, 'supports_set_soc', lambda: False)():
+                subscribe_set_soc(mqtt_client, device_topic=self.mqtt_topic_prefix, bms=bms)
 
             for sink in self.sinks:
                 try:
@@ -377,7 +572,13 @@ class BmsSampler:
 
             voltages = []
 
-            async def cached_fetch_voltages():
+            async def cached_fetch_voltages(optional=False):
+                """`optional`: only the impedance estimator wants them this cycle.
+                Its failure is not an error of the cycle: before the estimator
+                existed nothing fetched voltages then, so it must not push a
+                healthy link towards the error disconnect / power cycle. A
+                fetch a sink or the publish path needs still counts (it retries
+                after a failed optional one)."""
                 nonlocal voltages, err
                 if voltages:
                     return voltages
@@ -388,9 +589,13 @@ class BmsSampler:
 
                     if self.bms_group:
                         self.bms_group.update_voltages(bms, voltages)
-                except:
-                    logger.error("%s error fetching voltage", bms.name, exc_info=1)
-                    err = True
+                except Exception as e:
+                    if optional:
+                        logger.warning("%s error fetching voltage for the resistance estimator: %s", bms.name,
+                                       summarize_exc(e))
+                    else:
+                        logger.error("%s error fetching voltage", bms.name, exc_info=1)
+                        err = True
                     voltages = None
 
                 return voltages
@@ -399,6 +604,12 @@ class BmsSampler:
                 voltages = await cached_fetch_voltages()
                 for sink in self.sinks:
                     sink.publish_voltages(bms.name, voltages)
+
+            if self.impedance is not None and self.impedance.enabled:
+                # needs this iteration's cell voltages next to its current, so
+                # fetch them even when no sink asked for them
+                voltages = await cached_fetch_voltages(optional=True)
+                self._feed_impedance(sample, current_native, voltages)
 
             # z_score = self.power_stats.z_score(sample.power)
             # if abs(z_score) > 12:
@@ -462,6 +673,9 @@ class BmsSampler:
                     num_cells=len(voltages) if voltages else 0,
                     temperatures=sample.temperatures,
                     device_info=self.device_info,
+                    set_soc=getattr(bms, 'supports_set_soc', lambda: False)(),
+                    cell_resistance=self.impedance is not None and self.impedance.enabled,
+                    pack_temp_est=self._pack_temp_publisher is not None,
                 )
 
                 # publish sample again after discovery
@@ -489,12 +703,29 @@ class BmsSampler:
         # pass "light" errors to the caller to trigger a re-connect after too many
         return sample if not err else None
 
+    def _feed_impedance(self, sample: BmsSample, current: float, voltages):
+        temps = [t for t in (sample.temperatures or []) if isinstance(t, (int, float)) and -40 < t < 100]
+        temp = sorted(temps)[len(temps) // 2] if temps else None  # BMS probes; None if none, never a default
+        try:
+            r = self.impedance.add(sample.timestamp, current, voltages, soc=sample.soc, temp=temp,
+                                   pack_temp=self._pack_temp)
+        except Exception as e:
+            # an estimator bug must neither kill sampling nor keep publishing
+            logger.error('%s: cell resistance estimator failed, disabled: %s', self.bms.name, summarize_exc(e),
+                         exc_info=True)
+            self.impedance.disable('internal error')
+            return
+        if r is not None:
+            publish_cell_resistance(self.mqtt_client, device_topic=self.mqtt_topic_prefix, value_mohm=r)
+
     def publish_meters(self):
         device_topic = self.mqtt_topic_prefix
         for meter in self.meters:
             topic = f"{device_topic}/meter/{meter.name}"
-            s = round(meter.get(), 3)
-            mqtt_single_out(self.mqtt_client, topic, s)
+            s = meter.get()
+            if is_none_or_nan(s):
+                continue  # e.g. a monitor without current sensor (bm6) never feeds the Ah/kWh meters
+            mqtt_single_out(self.mqtt_client, topic, round(s, 3))
 
         if self.sinks:
             readings = {m.name: m.get() for m in self.meters}
@@ -561,7 +792,7 @@ class Downsampler:
         return s
 
 
-async def fetch_loop(fn, period, max_errors, should_stop=None):
+async def fetch_loop(fn, period, max_errors, should_stop=None, max_backoff=60):
     """Drive `fn` every `period` seconds, aborting after `max_errors` consecutive failures.
 
     `num_errors_row` counts *consecutive* failing cycles: it drives the 1.1**n
@@ -571,6 +802,12 @@ async def fetch_loop(fn, period, max_errors, should_stop=None):
     count grew for the lifetime of the add-on: every error slept the full 60 s
     cap after ~44 lifetime errors, and the watchdog aborted a perfectly healthy
     add-on once it reached 200 (#391).
+
+    `max_backoff` caps the error sleep. 60 s suits the serial loop, where one
+    device's failure would stall every other device behind it. A per-device
+    loop (concurrent_sampling) can back off much further for a device that is
+    never coming back, so its retries stop starving healthy neighbours sharing
+    the same proxy (#405).
     """
     num_errors_row = 0
     while not (should_stop and should_stop()):
@@ -597,5 +834,6 @@ async def fetch_loop(fn, period, max_errors, should_stop=None):
             if max_errors and num_errors_row > max_errors:
                 logger.warning('too many errors, abort')
                 break
-            await asyncio.sleep(min(1.1 ** num_errors_row, 60))
+            # clamp the exponent: 1.1 ** 7448 raises OverflowError and kills the loop
+            await asyncio.sleep(min(1.1 ** min(num_errors_row, 100), max_backoff))
         await asyncio.sleep(period)
