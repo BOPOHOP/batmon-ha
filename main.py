@@ -20,13 +20,16 @@ def _early_select_ble_stack():
     """
     import json
     opt = None
-    for path in ('options.json'): #, '/data/options.json', 'options.json'):
+    # for path in ('options.json'): #, '/data/options.json', 'options.json'):
+    for path in ('/home/homeassistant/batmon-ha/options.json', 'options.json'): #, '/data/options.json', 'options.json'):
         try:
             with open(path) as f:
                 opt = json.load(f)
+                print("json.load - done\n")
                 break
         except Exception:
             continue
+    print(f"opt.ble_stack: {opt}\n")
     if not opt or opt.get('ble_stack') != 'esphome':
         return None
     from bmslib.esphome_proxy import install_bleak_shim
