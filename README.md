@@ -114,6 +114,11 @@ displayed in the discovery list.
 `pace_uart`, `seplos_uart`, `braunpwr_uart`, `renogy_uart`, `supervolt`, `sok`, `sok_legacy`, `basen`, `basen_uart`, `litime`, `offgridtec`, `bm6`, `bm2`, `victron`, or any tag listed under [Supported BLE Devices](#supported-ble-devices).
 For a mock BMS use `dummy`.
 
+`type: auto` (Bluetooth only) asks the device at every start which protocol it speaks and logs the `type:` to put in
+the config instead. It knows `daly` (A5), `daly2` (Modbus), `jbd`, `jk` and `ant`, and accepts a type only on a
+valid reply to a read request, sent to that driver's own characteristic. A device that doesn't answer is skipped
+with an error, never guessed. Any other BMS still needs its `type:` set by hand.
+
 With the `alias` field you can set the MQTT topic prefix and the name as displayed in Home Assistant.
 Otherwise, the name as found in Bluetooth discovery is used.
 
@@ -161,6 +166,10 @@ For verbose logs of particular BMS add `debug: true`.
 * `expire_values_after` time span in seconds when sensor values become "Unavailable"
 * `impedance_estimator` (experimental, off by default) estimates the per-cell resistance of LiFePO4 packs and publishes
   it as a `Cell Resistance` sensor in mΩ. See [doc/Cell Resistance.md](doc/Cell%20Resistance.md).
+* `soh_estimator` (experimental, off by default) estimates the present capacity of LiFePO4 packs from long rests and
+  the charge counted between them, as `Qmax (est.)` (Ah) and `SoH (est.)` (%) sensors, against the per-device
+  `capacity:` (Ah, nameplate), without which it publishes nothing. On its built-in OCV curve it gives no value yet;
+  see [doc/SoH.md](doc/SoH.md).
 * `pack_temp_estimator` (experimental, off by default) estimates the cell temperature of packs whose BMS only reports a
   MOSFET temperature, as a `Pack Temp (RC est.)` sensor. `pack_temp_room_topic` / `pack_temp_outdoor_topic` are MQTT
   topics carrying ambient temperatures (e.g. from HA's `mqtt_statestream`); both are optional, without them the
@@ -169,7 +178,7 @@ For verbose logs of particular BMS add `debug: true`.
   after it exits)
 * For JK bms: set `type` to `jk_24s` for the older 24s version (firmware<11.x), `jk_32s` for the newer 32s version (fw>
   =11.x), or `jk` if you don't know (might cause invalid battery data when detection fails)
-* type `daly2` is for Daly BMS with the newer Bluetooth module (Modbus-over-BLE, GATT service `fff0` with `fff1/fff2`; the `daly` type logs `Characteristic ... was not found` on these). Reads, cell voltages and MOSFET switches work, see [issue #356](https://github.com/fl4p/batmon-ha/issues/356)
+* type `daly2` is for Daly BMS that speak Modbus over BLE (H/K/M/S series, frames start with `D2`). Reads, cell voltages and MOSFET switches work, see [issue #356](https://github.com/fl4p/batmon-ha/issues/356). The GATT layout doesn't tell the two Daly protocols apart: both use service `fff0` with `fff1/fff2`. If `daly2` only times out, use `daly` (classic `A5` frames, J/T/A/U/W series), or run `type: snoop:daly` and check whether the replies start with `a5` ([#416](https://github.com/fl4p/batmon-ha/issues/416))
 
 ## Serial / RS485
 
@@ -201,11 +210,15 @@ Supported types (baud rate in parentheses):
 * `braunpwr_uart` (9600) — BraunPWR packs with the KS48100 rack BMS: YD/T 1363
   ASCII protocol (`>22 01 4A 42 …\r`, command 42H). `braunpwr_uart:<addr>` for
   the pack address (default 1). It follows the DIP switch, but how is
-  unverified; if nothing answers, try 1 to 16. Built from a user's
-  working ESPHome config (an ESP32 fitted in place of the BMS's FC41D WiFi/BLE
-  module) and the manufacturer's protocol PDF. Wiring is unconfirmed: the
-  FC41D module's header or the BMS's RS485 port
-  ([#403](https://github.com/fl4p/batmon-ha/discussions/403)).
+  unverified; if nothing answers, try 1 to 16. Connect a USB-RS485 adapter
+  to the packs' RS485 port: in #403 two parallel packs answered on one bus as
+  addresses 1 and 2, so add one device per pack on the same adapter. Needs the
+  BMS's inverter protocol set to Voltronic: in Pylontech mode the packs answer
+  only Pylontech `~` system-summary requests. The BMS's internal 4-pin UART
+  header (where its FC41D WiFi/BLE module plugs in) speaks the same protocol,
+  but avoid it: its GND is the battery's, not the host's earth, and four plain
+  USB-TTL adapters burned out on it in #403. Decoder checked against real
+  reply frames ([#403](https://github.com/fl4p/batmon-ha/discussions/403)).
 * `renogy_uart` (9600) — Renogy smart lithium (RBT100LFP12, RBT200LFP12S, ...)
   Modbus RTU; `renogy_uart:<id>` for the slave id (default `0x30`; the
   RBT100LFP12SH-G1 uses `0xF7`).

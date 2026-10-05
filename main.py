@@ -1,4 +1,5 @@
 import asyncio
+import math
 import os
 import random
 import sys
@@ -78,10 +79,19 @@ async def fetch_loop(fn, period, max_errors, max_backoff=60):
         await fn.bms.disconnect()
 
 
-def store_states(samplers: list[BmsSampler]):
+def store_states(samplers: list[BmsSampler], final=False):
     meter_states = {s.bms.name: s.get_meter_state() for s in samplers}
     from bmslib.store import store_meter_states
     store_meter_states(meter_states)
+    for s in samplers:
+        try:
+            s.store_impedance_state(final=final)
+        except Exception as e:
+            logger.error('%s: error storing cell resistance state: %s', s.bms.name, e)
+        try:
+            s.store_qmax_state(final=final)
+        except Exception as e:
+            logger.error('%s: error storing Qmax/SoH state: %s', s.bms.name, e)
 
 
 def _runtime_kind():
@@ -279,7 +289,17 @@ async def main():
     names = set()
     dev_args: Dict[str, dict] = {}
 
-    for dev in user_config.get('devices', []):
+    devices = user_config.get('devices', [])
+    unresolved_auto: Dict[str, str] = {}  # ref -> label of `type: auto` devices left out
+    if any(str(d.get('type') or '').strip().lower() == 'auto' for d in devices):
+        # before construction: each `type: auto` becomes the type its device
+        # answered, or is skipped (doc in bmslib/auto_detect.py). The pair-only
+        # pre-step doesn't probe, it only needs to know which devices are left out.
+        from bmslib.auto_detect import resolve_auto_devices
+        devices, unresolved_auto = await resolve_auto_devices(
+            devices, bmslib.bt.discovered_adverts, ble_devices, detect_now=not pair_only)
+
+    for dev in devices:
 
         bms = construct_bms(dev, verbose_log, ble_devices)
 
@@ -297,6 +317,7 @@ async def main():
     bms_by_name: dict[str, bmslib.bt.BtBms] = {bms.address: bms for bms in bms_list if not bms.is_virtual}
     bms_by_name.update({bms.name: bms for bms in bms_list})
     groups_by_bms: dict[str, BmsGroup] = {}
+    disabled_groups = []
 
     for bms in bms_list:
         if 'keep_alive' in user_config:
@@ -304,6 +325,15 @@ async def main():
 
         if isinstance(bms, VirtualGroupBms):
             group_bms = bms
+            missing = [r for r in bms.get_member_refs() if resolve_member_ref(bms_by_name, r) is None
+                       and resolve_member_ref(unresolved_auto, r) is not None]
+            if missing:
+                # a member whose `type: auto` was not detected: drop the group (a
+                # partial group would publish a wrong battery), start everything else
+                logger.error('group %s disabled: member(s) %s have `type: auto` and were not detected',
+                             group_bms.name, ', '.join(m.strip() for m in missing))
+                disabled_groups.append(group_bms)
+                continue
             for member_ref in bms.get_member_refs():
                 member = resolve_member_ref(bms_by_name, member_ref)
                 if member is None:
@@ -323,6 +353,10 @@ async def main():
 
                 groups_by_bms[member_name] = group_bms.group
                 bms.add_member(member)
+
+    for group_bms in disabled_groups:
+        bms_list.remove(group_bms)
+        bms_by_name.pop(group_bms.name, None)
 
     # import env vars from addon_main.sh
     for k, en in dict(mqtt_broker='MQTT_HOST', mqtt_port='MQTT_PORT', mqtt_user='MQTT_USER',
@@ -450,6 +484,23 @@ async def main():
         except Exception as e:
             logger.warning('GUI state disabled: %s', e)
 
+    from bmslib.store import load_impedance_state, load_qmax_state
+
+    def design_capacity(name):
+        """The per-device `capacity:` option [Ah], None when unset or unusable."""
+        c = dev_args[name].get('capacity')
+        if c in (None, ''):
+            return None
+        try:
+            c = float(c)
+        except (TypeError, ValueError):
+            c = math.nan
+        if not (math.isfinite(c) and c > 0):
+            logger.warning('%s: ignoring capacity=%r, expected the design capacity in Ah', name,
+                           dev_args[name].get('capacity'))
+            return None
+        return c
+
     sampler_list = [BmsSampler(
         bms, mqtt_client=mqtt_client,
         dt_max_seconds=max(60. * 10, sample_period * 2),
@@ -465,7 +516,11 @@ async def main():
         bt_power_cycle_on_error=user_config.get('bt_power_cycle_on_error', False),
         reconnect_interval_s=float(user_config.get('reconnect_interval_minutes') or 0) * 60 or None,  # <=0 -> off
         impedance_estimator=bool(user_config.get('impedance_estimator', False)),
+        impedance_state=user_config.get('impedance_estimator') and load_impedance_state(bms.name),
         ambient_cache=ambient_cache,
+        soh_estimator=bool(user_config.get('soh_estimator', False)),
+        soh_state=user_config.get('soh_estimator') and load_qmax_state(bms.name),
+        design_capacity=design_capacity(bms.name),
     ) for bms in bms_list]
 
     # move groups to the end
@@ -588,7 +643,7 @@ async def main():
 
     shutdown = True
 
-    store_states(sampler_list)
+    store_states(sampler_list, final=True)
 
     for sink in sinks:
         try:

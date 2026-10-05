@@ -2,9 +2,11 @@
 
 * the online estimator in the add-on (`impedance_estimator`): [Cell Resistance](../Cell%20Resistance.md),
   code in `bmslib/impedance.py`
+* the online Qmax/SoH estimator (`soh_estimator`): [Capacity / SoH](../SoH.md), code in `bmslib/qmax.py`;
+  on the relaxed OCV curve its tightened gates accept no segment, see there
 
-* see tools/impedance for code
-* [tools/impedance/README](../../tools/impedance/README.md)
+* the offline prototype and its data analysis live in the separate bat-impedance project;
+  until 273ba16 they were `tools/impedance/` here (`git show 273ba16^:tools/impedance/README.md`)
 
 
 * there is AC and DC cell resistance

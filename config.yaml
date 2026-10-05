@@ -1,7 +1,7 @@
 name: "Batmon"
 description: "Monitor various BMS over bluetooth"
 url: https://github.com/fl4p/batmon-ha
-version: "2.21"
+version: "2.23"
 slug: "batmon"
 init: false
 host_dbus: true
@@ -90,6 +90,7 @@ options:
   bluetooth_proxies: []
   telemetry: true
   impedance_estimator: false
+  soh_estimator: false
 
 schema:
   devices:
@@ -101,6 +102,9 @@ schema:
       adapter: "str?"
       algorithm: "str?"
       current_calibration: "float?"
+      # design (nameplate) capacity in Ah: soh_estimator's reference, which it
+      # needs to publish anything (the BMS-reported capacity is never used)
+      capacity: "float?"
       note: "str?"
 
   mqtt_user: "str?"
@@ -179,6 +183,13 @@ schema:
   # sampled current and cell voltages, published as a `cell_resistance` sensor
   # (mOhm). See doc/Cell Resistance.md.
   impedance_estimator: "bool?"
+
+  # Experimental: estimate the present capacity (Qmax) of LiFePO4 packs from
+  # relaxed-rest cell voltages and the coulomb count between them, published as
+  # `qmax_est` (Ah) and `soh_est` (%, against the device's `capacity:`, without
+  # which nothing is published). Needs long rests near empty; see doc/SoH.md for
+  # how rarely that gives a value.
+  soh_estimator: "bool?"
 
   # Experimental: estimate the cell temperature of packs whose BMS only reports
   # a MOSFET temperature, as a `pack_temp_est` sensor. Room/outdoor topics are

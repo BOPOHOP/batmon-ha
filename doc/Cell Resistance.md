@@ -40,11 +40,38 @@ These gates were tuned on large packs. A small pack that never draws 8 A steps w
 purpose: no value is better than a wrong one. The log says once per hour how many windows were evaluated and why they
 were rejected.
 
+A sample with a current no pack can carry is left out too: more than 5× the capacity (the device's `capacity:` option,
+else what the BMS reports), never more than 1000 A. That is a decode glitch, like the 2 147 483 A (2³¹ mA) seen from a
+JK BMS.
+
 A sample with any cell outside 2.5–3.7 V is left out (a garbled BLE frame, a runner cell at the top of a charge). The
 estimator switches itself off for a BMS only when the median cell voltage stays outside that band for 10 minutes,
 because the gates only hold for LiFePO4. The log says so once, as a warning.
 
 Cell voltages are fetched on every sample while the estimator is on, even if no other sink needs them. A failed fetch
 that only the estimator asked for is logged but does not count towards the reconnect logic.
+
+## Restarts
+
+The estimator's state is saved per BMS in `impedance_<name>.json` in the add-on's data directory: the accepted
+windows and the learnt quantisation steps every 30 s when they changed, and everything, including the window in
+progress, at shutdown. After a restart the saved windows count towards the 5, so there is no new warm-up, and the saved
+estimate is published again with the next accepted window. A restart within a window continues that window. Windows
+timed after a newer one (the clock stepped back, or the state was saved while it ran ahead) leave the median: their age
+is unknown.
+
+Not restored:
+
+* windows saved by different estimator code (an add-on update that changed it): they would mix two definitions of R in
+  one median, so the warm-up starts again; the learnt quantisation steps are kept. What counts as a change: the
+  bytecode of any function or method in `bmslib/impedance.py` or `bmslib/estimator_common.py`, a default argument, a
+  module-level constant (every gate), or the Python version. Comments, docstrings, blank lines and where code sits in
+  the file do not,
+* a state file that does not validate (logged as a warning): the estimator starts fresh,
+* a switch-off after an internal error: the next start tries again. A switch-off because the pack is not LiFePO4 is
+  kept.
+
+Delete the file to start over, for example after swapping the pack behind a BMS name or to retry after a non-LiFePO4
+switch-off.
 
 Background and the offline analysis: [dev/Impedance.md](dev/Impedance.md).

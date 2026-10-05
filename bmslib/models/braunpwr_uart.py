@@ -1,17 +1,32 @@
 """BraunPWR / KS48100-HO20_V1 rack BMS over its wired UART (#403).
 
-UNTESTED ON HARDWARE. Built from two sources only, and no raw reply frame has
-been captured yet:
-  - the working ESPHome config of the #403 reporter (bialy39), who pulled the
-    BMS's Quectel FC41D WiFi/BLE module (its BLE link kept dropping) and polls
-    the BMS from an ESP32 through the ``uartex`` component instead;
+Wiring: a USB-RS485 adapter on the packs' RS485 port. In #403 two parallel
+packs answered the 42H request there as ADR 1 and 2 on one bus (2026-09-29),
+so one adapter serves both (`braunpwr_uart:1`, `braunpwr_uart:2`). The BMS's
+internal 4-pin TTL UART header (GND/TX/RX/VIN), where its Quectel FC41D
+WiFi/BLE module plugs in, speaks the same protocol: the reporter (bialy39)
+polls it from an ESP32. But its GND is the battery's, and four mains-earthed
+USB-TTL adapters burned out on it there; prefer RS485. (The module's BLE drops
+that started #403 went away when it was powered externally: the BMS's own
+supply to it is unstable.)
+
+Sources:
+  - the reporter's working ESPHome config (``uartex`` component);
   - the manufacturer's protocol PDF "X 1363_Protocol_V1_0_1" (Chinese), which is
     YD/T 1363.3-2014: table 23 (42H field order), table 24 (status words),
-    table 19 (current sign).
-Where the two meet they agree (SOI 0x3E, 42H echo in the response's CID1 slot,
-field offsets up to the alarm words). Wiring is unconfirmed: the reporter's
-ESP32 sits either on the header the FC41D module plugged into or behind an
-RS485 transceiver; we don't know which.
+    table 19 (current sign);
+  - real request/reply pairs from his pack (bmslib/test/test_braunpwr_uart.py
+    REAL_FRAMES). They decode with no warning and their fields cross-check:
+    cells sum to the pack voltage, remaining/full Ah equals SOC, and the
+    charging bit comes with a positive raw current.
+The decoder is verified against those frames; the driver itself has not yet
+run against the hardware.
+
+Protocol mode: with the BMS's inverter protocol (DIP switches) on Pylontech,
+the header ignores every '>' request, at any ADR, and answers only Pylontech
+'~' frames: 61H system summary from the master (voltage, current, SOC, cell
+min/max, no per-cell data), zeros from a slave, and no reply to per-pack 42H.
+This driver therefore needs Voltronic mode, which is what the reporter runs.
 
 Wire format: the ASCII-hex YD/T 1363 framing already implemented in
 ``bmslib.models.pace`` (builder, parser, LENGTH/CHKSUM), with a different SOI:

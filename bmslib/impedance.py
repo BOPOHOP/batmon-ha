@@ -47,6 +47,9 @@ prototype produced a plausible wrong number without it:
    MAX_MEDIAN_DT_S is unevaluable.
  * Missing inputs are never replaced by plausible values: no SoC means no DOD
    tag and a failed drift gate; no temperature means temp None.
+ * A current no pack can carry (a decode glitch such as 2^31 mA; above
+   I_MAX_C_RATE x capacity or I_MAX_ABS_A, estimator_common) makes the sample
+   no pair: it never reaches a bin, a window or the learnt quantisation.
 
 Each accepted window is tagged with DOD, the median BMS temperature probe
 (`temp`) and, when pack_temp_estimator runs, the median RC pack-temperature
@@ -73,9 +76,14 @@ check and the cross-cell lag agreement exist for that case; the replay then
 publishes nothing with the sign flipped. It remains a heuristic, not a proof.
 """
 import math
+import threading
 from collections import Counter, deque
-from typing import Any, Dict, List, Optional, Sequence, Tuple, TypeGuard
+from typing import Any, Dict, List, Optional, Sequence, Tuple
 
+from bmslib import estimator_common
+from bmslib.estimator_common import (CHEM_PERSIST_N, CHEM_PERSIST_S, I_MAX_ABS_A, I_MAX_C_RATE, LFP_MV_HI,
+                                     LFP_MV_LO, chemistry_step, current_ceiling, finite as _finite,
+                                     fmt_t as _fmt_t, locked, median)
 from bmslib.util import get_logger
 
 logger = get_logger()
@@ -123,26 +131,16 @@ ROUNDOFF_REL = 1e-9
 IRLS_ITERS = 2
 IRLS_K = 4.0
 
-# Chemistry guard: only LFP-looking packs. A sample with any cell outside this
-# band is dropped; the estimator is disabled for the BMS (warning, once) when
-# the median cell voltage stays outside it for CHEM_PERSIST_S seconds AND
-# CHEM_PERSIST_N samples in a row.
-# Why 10 minutes / 30 samples: the out-of-band readings seen on real LFP data
-# are single decode glitches lasting a few frames (2023-11-14: 3732/3119 mV,
-# then 3329/3512/2798/2926, then normal, within 5 s) and single runner cells
-# at the top of a charge, which never move the median. A non-LFP pack (NMC
-# rests at 3.7-4.1 V per cell) sits outside the band for hours, so waiting 10
-# minutes costs nothing; the per-cell 2700-3600 mV window gate already keeps
-# its samples out of any fit meanwhile. The sample count keeps two readings
-# either side of a 10-minute outage from counting as "persistent".
-LFP_MV_LO, LFP_MV_HI = 2500.0, 3700.0
-CHEM_PERSIST_S = 600.0
-CHEM_PERSIST_N = 30
+# Chemistry guard (LFP_MV_LO/HI, CHEM_PERSIST_S/N): see bmslib/estimator_common.py.
+# Imported into this module's namespace, and passed from here, so that moving
+# them on this module (as the tests do) moves them for this estimator only.
 
 # --- output ---
 ROLLING_WINDOWS = 20  # published value = median over the last N accepted windows
 PUBLISH_MIN_WINDOWS = 5  # publish nothing before this many windows were accepted
-# ... and only windows from the last 7 days count. R changes by ~1.5x per 10 C,
+# ... and only windows from the last 7 days count, measured from the newest
+# window; one timed after it (a clock that stepped back) leaves the median as
+# of unknown age. R changes by ~1.5x per 10 C,
 # so a median that mixes windows from different seasons describes no actual
 # state of the pack (on ANT24 the last 20 windows spanned months). Seven days
 # still lets a pack with a few heavy loads per week collect 5 windows, and
@@ -150,18 +148,8 @@ PUBLISH_MIN_WINDOWS = 5  # publish nothing before this many windows were accepte
 MAX_WINDOW_AGE_S = 7 * 86400.0
 SUMMARY_PERIOD_S = 3600.0  # info-level summary of what the gates did
 
-
-def _finite(x) -> TypeGuard[float]:
-    return isinstance(x, (int, float)) and math.isfinite(x)
-
-
-def median(xs: Sequence[float]) -> float:
-    s = sorted(xs)
-    n = len(s)
-    if n == 0:
-        return math.nan
-    m = n // 2
-    return s[m] if n % 2 else 0.5 * (s[m - 1] + s[m])
+# --- persistence (get_state / restore) ---
+STATE_VERSION = 1
 
 
 def noise_std(xs: Sequence[float]) -> Optional[float]:
@@ -537,6 +525,7 @@ class CellResistanceEstimator:
 
     def __init__(self, name: str):
         self.name = name
+        self._lock = getattr(self, '_lock', None) or threading.RLock()  # kept when restore() re-inits
         self.enabled = True
         self.disabled_reason: Optional[str] = None
         self._rows = deque()  # closed bins
@@ -555,8 +544,10 @@ class CellResistanceEstimator:
         self.counts = Counter()  # window outcomes since the last summary
         self.cell_reasons = Counter()
         self.n_dropped = 0  # samples with a cell outside the LFP band, since the last summary
+        self.n_i_rejected = 0  # samples with an impossible current, since the last summary
         self._t_summary: Optional[float] = None
         self._announced = False
+        self._disable_persistent = False  # only a chemistry verdict survives a restart
 
     @property
     def value(self) -> Optional[float]:
@@ -567,14 +558,155 @@ class CellResistanceEstimator:
             return None
         return median([w['r'] for w in self.windows])
 
-    def disable(self, reason: str):
+    @locked
+    def disable(self, reason: str, persistent: bool = True):
+        """persistent=False for an internal error: that says nothing about the
+        pack, and a restart (maybe onto fixed code) should try again."""
         if self.enabled:
             logger.warning('%s: cell resistance estimator disabled: %s', self.name, reason)
         self.enabled = False
         self.disabled_reason = reason
+        self._disable_persistent = persistent
         self._rows.clear()
         self._bin = None
         self.windows.clear()
+
+    # ------------------------------------------------------------ persistence
+
+    @locked
+    def get_state(self, full: bool = True) -> Dict[str, Any]:
+        """JSON-serialisable state. full=False leaves out what changes on every
+        sample (the open window, the summary counters), so a periodic save only
+        rewrites the file when a window was accepted or a step was learnt;
+        full=True (at shutdown) is everything, so a restart within one window
+        continues exactly where it stopped."""
+        st: Dict[str, Any] = dict(
+            version=STATE_VERSION, code=CODE_FINGERPRINT,
+            disabled_reason=self.disabled_reason if (not self.enabled and self._disable_persistent) else None,
+            q_i=self.q_i, q_u=list(self.q_u),
+            windows=[dict(w) for w in self.windows],
+        )
+        if full:
+            b = self._bin
+            st.update(
+                last_t=self._last_t, next_end=self._next_end,
+                rows=[[r[0], r[1], r[2], list(r[3]), r[4], r[5]] for r in self._rows],
+                bin=None if b is None else {k: (list(v) if isinstance(v, list) else v)
+                                            for k in _Bin.__slots__ for v in (getattr(b, k),)},
+                prev_i=self._prev_i, prev_u=None if self._prev_u is None else list(self._prev_u),
+                oob_since=self._oob_since, oob_n=self._oob_n,
+                counts=dict(self.counts), cell_reasons=dict(self.cell_reasons), n_dropped=self.n_dropped,
+                n_i_rejected=self.n_i_rejected, t_summary=self._t_summary, announced=self._announced,
+            )
+        return st
+
+    @locked
+    def restore(self, st) -> bool:
+        """Load a get_state() dict. Anything that does not validate starts the
+        estimator fresh (warning) rather than half-restored: a state that cannot
+        be checked is never trusted as good. Nothing is published here -- the
+        restored estimate goes out with the next accepted window."""
+        try:
+            self._restore(st)
+        except Exception as e:
+            logger.warning('%s: cell resistance state not restored (%s: %s), starting fresh',
+                           self.name, type(e).__name__, e)
+            self.__init__(self.name)
+            return False
+        return True
+
+    def _restore(self, st):
+        def fin(x, what):
+            if not _finite(x) or isinstance(x, bool):
+                raise ValueError('%s is %r' % (what, x))
+            return float(x)
+
+        def opt_fin(x, what):
+            return None if x is None else fin(x, what)
+
+        def step(x, what):
+            if x is not None and fin(x, what) <= 0:
+                raise ValueError('%s is %r' % (what, x))
+            return x
+
+        if not isinstance(st, dict) or st.get('version') != STATE_VERSION:
+            raise ValueError('state version %r, expected %d'
+                             % (st.get('version') if isinstance(st, dict) else type(st).__name__, STATE_VERSION))
+        q_i = step(st.get('q_i'), 'q_i')
+        q_u = st.get('q_u') or []
+        if not isinstance(q_u, list):
+            raise ValueError('q_u is %r' % type(q_u).__name__)
+        q_u = [step(q, 'q_u') for q in q_u]
+
+        self.__init__(self.name)
+        self.q_i, self.q_u = q_i, q_u  # a property of the BMS, not of this code
+        if CODE_FINGERPRINT is None or st.get('code') != CODE_FINGERPRINT:
+            logger.info('%s: cell resistance estimator code changed since the state was saved: accepted '
+                        'windows discarded, learnt quantisation kept', self.name)
+            return
+
+        reason = st.get('disabled_reason')
+        if reason is not None:
+            self.enabled, self.disabled_reason, self._disable_persistent = False, str(reason), True
+            logger.info('%s: cell resistance estimator stays disabled (saved state): %s', self.name, reason)
+            return
+
+        windows = []
+        for w in st.get('windows') or []:
+            if not isinstance(w, dict):
+                raise ValueError('window is %r' % type(w).__name__)
+            fin(w.get('t'), 'window t')
+            if not R_MOHM_LO < fin(w.get('r'), 'window r') < R_MOHM_HI:
+                raise ValueError('window r %r outside %.1f..%.1f mOhm' % (w['r'], R_MOHM_LO, R_MOHM_HI))
+            windows.append(dict(w))
+        if any(a['t'] > b['t'] for a, b in zip(windows, windows[1:])):
+            raise ValueError('windows not in time order')
+        self.windows.extend(windows[-ROLLING_WINDOWS:])
+
+        if 'last_t' in st:  # full state
+            self._last_t = opt_fin(st.get('last_t'), 'last_t')
+            self._next_end = opt_fin(st.get('next_end'), 'next_end')
+            rows = []
+            for r in st.get('rows') or []:
+                if not isinstance(r, list) or len(r) != 6 or not isinstance(r[3], list):
+                    raise ValueError('row %r' % (r,))
+                rows.append((fin(r[0], 'row t'), fin(r[1], 'row i'), float(r[2]),
+                             tuple(float(v) for v in r[3]), opt_fin(r[4], 'row temp'), opt_fin(r[5], 'row ptemp')))
+            if any(a[0] > b[0] for a, b in zip(rows, rows[1:])) or \
+                    (rows and (self._last_t is None or rows[-1][0] > self._last_t)):
+                raise ValueError('rows not in time order')
+            self._rows.extend(rows)
+            b = st.get('bin')
+            if b is not None:
+                if not isinstance(b, dict) or set(b) != set(_Bin.__slots__):
+                    raise ValueError('bin %r' % (b,))
+                nb = _Bin(int(b['idx']), len(b['su']))
+                for k in _Bin.__slots__:
+                    setattr(nb, k, b[k])
+                if not isinstance(nb.n, int) or nb.n < 1 or len(nb.su) != len(nb.nu):
+                    raise ValueError('bin %r' % (b,))
+                fin(nb.st, 'bin st'), fin(nb.si, 'bin si')
+                nb.su = [fin(v, 'bin su') for v in nb.su]
+                nb.nu = [int(k) for k in nb.nu]
+                self._bin = nb
+            self._prev_i = opt_fin(st.get('prev_i'), 'prev_i')
+            pu = st.get('prev_u')
+            self._prev_u = None if pu is None else tuple(float(v) for v in pu)
+            self._oob_since = opt_fin(st.get('oob_since'), 'oob_since')
+            self._oob_n = int(st.get('oob_n') or 0)
+            self.counts.update({str(k): int(v) for k, v in (st.get('counts') or {}).items()})
+            self.cell_reasons.update({str(k): int(v) for k, v in (st.get('cell_reasons') or {}).items()})
+            self.n_dropped = int(st.get('n_dropped') or 0)
+            self.n_i_rejected = int(st.get('n_i_rejected') or 0)
+            self._t_summary = opt_fin(st.get('t_summary'), 't_summary')
+        self._announced = bool(st.get('announced')) or len(self.windows) >= PUBLISH_MIN_WINDOWS
+
+        v = self.value
+        logger.info('%s: cell resistance state restored: %d windows%s, estimate %s (published with the next '
+                    'accepted window)', self.name, len(self.windows),
+                    (', newest from %s' % _fmt_t(self.windows[-1]['t'])) if self.windows else '',
+                    ('%.3f mOhm' % v) if v is not None else
+                    'none yet (%d/%d windows)' % (len(self.windows), PUBLISH_MIN_WINDOWS))
 
     def _restart(self):
         self._rows.clear()
@@ -588,20 +720,15 @@ class CellResistanceEstimator:
         fin = [v for v in vt if v == v]
         if not fin:
             return True
-        med = median(fin)
-        if LFP_MV_LO <= med <= LFP_MV_HI:
-            self._oob_since = None
-            self._oob_n = 0
-        else:
-            if self._oob_since is None:
-                self._oob_since = t
-            self._oob_n += 1
-            if t - self._oob_since >= CHEM_PERSIST_S and self._oob_n >= CHEM_PERSIST_N:
-                self.disable('the median cell voltage has been outside %.0f..%.0f mV for %.0f s (%d samples, '
-                             'now %.0f mV); the gates are only valid for LiFePO4'
-                             % (LFP_MV_LO, LFP_MV_HI, t - self._oob_since, self._oob_n, med))
-                return False
-        if min(fin) < LFP_MV_LO or max(fin) > LFP_MV_HI:
+        self._oob_since, self._oob_n, verdict, med = chemistry_step(
+            self._oob_since, self._oob_n, t, fin, LFP_MV_LO, LFP_MV_HI, CHEM_PERSIST_S, CHEM_PERSIST_N)
+        if verdict == 'disable':
+            assert self._oob_since is not None
+            self.disable('the median cell voltage has been outside %.0f..%.0f mV for %.0f s (%d samples, '
+                         'now %.0f mV); the gates are only valid for LiFePO4'
+                         % (LFP_MV_LO, LFP_MV_HI, t - self._oob_since, self._oob_n, med))
+            return False
+        if verdict == 'drop':
             self.n_dropped += 1
             return False
         return True
@@ -622,16 +749,18 @@ class CellResistanceEstimator:
         self._prev_i = i
         self._prev_u = vt
 
+    @locked
     def add(self, t: float, current: float, voltages: Optional[List[float]],
             soc: Optional[float] = None, temp: Optional[float] = None,
-            pack_temp: Optional[float] = None) -> Optional[float]:
+            pack_temp: Optional[float] = None, capacity: Optional[float] = None) -> Optional[float]:
         """Feed one sampler iteration.
 
         t: sample timestamp [s]; current: [A], BmsSample sign (positive =
         discharging) before invert_current; voltages: cell voltages [mV] from
         the same iteration, or None if they could not be fetched; soc [%],
         temp (BMS probes) and pack_temp (RC estimate) [degC] may be None/NaN
-        when unknown.
+        when unknown; capacity [Ah] (the option, else the BMS's) only bounds
+        the plausible current, None/NaN when unknown.
 
         Returns the new rolling value when this call accepted a window and at
         least PUBLISH_MIN_WINDOWS are in, else None -- so a caller that
@@ -644,6 +773,13 @@ class CellResistanceEstimator:
                 return None  # the BMS re-served the same measurement: not a new pair
             if t < self._last_t or t - self._last_t > WINDOW_S:
                 self._restart()  # clock stepped back, or a gap longer than a window
+            if t < self._last_t:
+                # timed on a clock that ran ahead: the summary and the
+                # chemistry run would wait for real time to catch up
+                if self._t_summary is not None and self._t_summary > t:
+                    self._t_summary = t
+                if self._oob_since is not None and self._oob_since > t:
+                    self._oob_since = t
         self._last_t = t
 
         vt = None
@@ -654,6 +790,9 @@ class CellResistanceEstimator:
                     return None
                 vt = None  # dropped: not a pair, but time still moves on
         i_chg = -float(current) if _finite(current) else math.nan
+        if i_chg == i_chg and abs(i_chg) > current_ceiling(capacity, I_MAX_C_RATE, I_MAX_ABS_A):
+            self.n_i_rejected += 1  # a decode glitch, not a current: no pair
+            i_chg = math.nan
         use = vt is not None and i_chg == i_chg and any(v == v for v in vt)
         if use:
             self._learn_quantisation(i_chg, vt)
@@ -682,6 +821,7 @@ class CellResistanceEstimator:
                 self.windows.append(res)
                 while self.windows[0]['t'] < res_t - MAX_WINDOW_AGE_S:
                     self.windows.popleft()
+                self._drop_windows_after(res_t)
                 logger.debug('%s: cell resistance window R=%.3f mOhm (%d/%d cells, dod=%.0f, temp=%s, '
                              'pack_temp=%s)', self.name, res['r'], res['n_accepted'], res['n_cells'], res['dod'],
                              res['temp'], res['pack_temp'])
@@ -705,19 +845,42 @@ class CellResistanceEstimator:
             self._bin.add(t, i_chg, s, vt, tc, tp)
         return new_value
 
+    def _drop_windows_after(self, t):
+        """Called with the newest window's time, just appended. A kept window
+        timed after it was timed on a clock that ran ahead (the clock stepped
+        back since, or the saved state was written while it ran ahead). Its
+        age is unknown, so it leaves the median instead of counting as recent
+        until real time catches up with it. The windows are otherwise in time
+        order, so the one before the newest is the only one to check."""
+        if len(self.windows) > 1 and self.windows[-2]['t'] > t:
+            n = len(self.windows)
+            self.windows = deque((w for w in self.windows if w['t'] <= t), maxlen=ROLLING_WINDOWS)
+            logger.info('%s: cell resistance: %d window(s) timed after %s dropped (the clock stepped back)',
+                        self.name, n - len(self.windows), _fmt_t(t))
+
     def _log_summary(self):
         n = sum(self.counts.values())
-        if n or self.n_dropped:
+        if n or self.n_dropped or self.n_i_rejected:
             rej = ', '.join('%s=%d' % kv for kv in sorted(self.counts.items()) if kv[0] != 'accepted')
             cells = ', '.join('%s=%d' % kv for kv in self.cell_reasons.most_common(3))
             v = self.value
-            logger.info('%s: cell resistance: %d windows, %d accepted (%s%s)%s, estimate %s',
+            logger.info('%s: cell resistance: %d windows, %d accepted (%s%s)%s%s, estimate %s',
                         self.name, n, self.counts['accepted'], rej or 'none rejected',
                         ('; cells: ' + cells) if cells else '',
                         ('; %d samples dropped with a cell outside %.0f..%.0f mV'
                          % (self.n_dropped, LFP_MV_LO, LFP_MV_HI)) if self.n_dropped else '',
+                        ('; %d samples dropped with an impossible current' % self.n_i_rejected)
+                        if self.n_i_rejected else '',
                         ('%.3f mOhm' % v) if v is not None else
                         'none yet (%d/%d windows)' % (len(self.windows), PUBLISH_MIN_WINDOWS))
         self.counts.clear()
         self.cell_reasons.clear()
         self.n_dropped = 0
+        self.n_i_rejected = 0
+
+
+# Accepted windows are only restored into the code that computed them: after an
+# upgrade that changed any gate or the fit, old windows would mix two
+# definitions of R in one median. Computed last, over the code that actually
+# runs, this module's and the shared helpers' (estimator_common.code_fingerprint).
+CODE_FINGERPRINT = estimator_common.code_fingerprint(globals(), vars(estimator_common))

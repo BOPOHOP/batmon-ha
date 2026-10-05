@@ -1,6 +1,8 @@
 """braunpwr_uart (KS48100 rack BMS, YD/T 1363 over UART, #403).
 
-No reply frame from real hardware exists yet. The references here are:
+References:
+  - real request/reply pairs from the reporter's pack (uart_debug log from an
+    ESP32 on the BMS's internal TTL header, 2026-09-24): REAL_FRAMES below;
   - the reporter's working ESPHome config (bialy39, discussion #403): its C++
     request builder and response-offset lambdas are transcribed below, line by
     line, as independent implementations to compare the driver against;
@@ -130,6 +132,76 @@ def analog_info(cells=CELLS, current_raw=-1234, soc=87.65, voltage=52.84, temps=
 def response(info, adr=1, rtn=0x00, soi=0x3E, echo=0x42):
     # response header: VER ADR <42H echo> <RTN>; build_frame's cid1/cid2 slots
     return build_frame(0x22, adr, echo, rtn, info, soi=soi)
+
+
+# --- real frames ---------------------------------------------------------------
+
+# 16S 120 Ah pack, charging at ~4.6 A, from the reporter's uart_debug log (#403).
+# ESPHome split each reply over two log lines; the halves are rejoined here.
+REAL_FRAMES = [
+    b">22014200E0C6001C6014F9100D1B0D1C0D1C0D1C0D1C0D1C0D1D0D1D0D1D0D1D0D1C0D1C0D1C0D1D0D1C0D1A01400124012204012C01220122012201CE00000064012EE0220D000900000"
+    b"0010000000000230000000000000000000000000000000000000000000000D4E5\r",
+    b">22014200E0C6001C6314FA100D1B0D1B0D1D0D1D0D1D0D1D0D1D0D1D0D1D0D1D0D1C0D1D0D1D0D1C0D1D0D1A01400124012204012C01220122012201CA00000064012EE02210000900000"
+    b"0010000000000230000000000000000000000000000000000000000000000D4EC\r",
+]
+
+
+def test_real_frames_decode_consistently(serial_stub):
+    """The fields cross-check each other: cells sum to the pack voltage,
+    remaining/full Ah equals SOC, and the charging bit agrees with the sign."""
+    assert build_request(1) == b'>22014A42E00201FD28\r'  # the request that got them
+    for frame in REAL_FRAMES:
+        fields = parse_frame(frame, sois=BraunPwrUart.RX_SOIS)
+        assert (fields['ver'], fields['adr'], fields['cid1'], fields['cid2']) == (0x22, 1, 0x42, 0x00)
+        a = decode_analog(fields['info'])
+        assert len(a['cell_mv']) == 16
+        assert sum(a['cell_mv']) / 1000 == pytest.approx(a['voltage'], abs=0.02)
+        assert a['remaining_ah'] / a['full_ah'] * 100 == pytest.approx(a['soc'], abs=0.01)
+        assert a['full_ah'] == pytest.approx(120.0) and a['cycles'] == 9 and a['soh'] == 100
+        assert (a['t_ambient'], a['t_pack'], a['t_mos']) == pytest.approx((32.0, 29.2, 29.0))
+        assert a['cell_temps'] == pytest.approx([30.0, 29.0, 29.0, 29.0])
+        assert a['current_scale'] == 0.01 and not a['current_unit_conflict']
+        assert a['status']['current'] & 1  # charging bit ...
+        assert a['current'] > 0            # ... with a positive raw current
+
+    bms = BraunPwrUart('serial', name='b', adapter='/dev/ttyUSB0')
+    sample, volts = _fetch(bms, REAL_FRAMES[0])
+    assert sample.voltage == pytest.approx(53.69) and sample.soc == pytest.approx(72.64)
+    assert sample.current == pytest.approx(-4.62)  # charging -> negative in batmon
+    assert sample.battery_charging is True
+    # FET status 0x23: both FETs on, B5B4 = 10 is the 10 A current-limit mode, not a fault
+    assert sample.switches == dict(charge=True, discharge=True)
+    assert sample.problem_code == 0 and sample.problem is False
+    assert volts[:3] == [3355, 3356, 3356] and volts[-1] == 3354
+
+
+# Both parallel packs answering on one RS485 bus (2026-09-29), ADR 1 and 2. His
+# 1 s capture window cut each reply after the first two CHKSUM characters, so
+# these are checked as INFO plus the CHKSUM prefix, not as complete frames.
+RS485_TRUNCATED = {
+    1: b">22014200E0C60013EB145E100CBD0CB90CBC0CBC0CBD0CB90CBD0CB90CBC0CBA0CBD0CB90CBD0CBA0CBD0CB8014A"
+       b"01220136040122012201220122F6D000000064012EE017E7004C000000020000000000230000000000000000000000"
+       b"000000000000000000000000D3",
+    2: b">22024200E0C6001073145E100CB90CBB0CBB0CBC0CBB0CBB0CBC0CBC0CBC0CBB0CBC0CBC0CBB0CBC0CBC0CB80140"
+       b"0118012C040118011801180118F6FD00000064012EE013BD000C000000020000000000230000000000000000000000"
+       b"000000000000000000000000D3",
+}
+
+
+def test_rs485_replies_from_two_packs_on_one_bus():
+    for adr, raw in RS485_TRUNCATED.items():
+        body = raw[1:]
+        assert body[2:4] == b'%02X' % adr and body[4:8] == b'4200'
+        lenid = int(body[9:12], 16)
+        info = body[12:12 + lenid]
+        assert ('%04X' % _checksum(body[:12 + lenid])).encode()[:2] == body[12 + lenid:]
+        a = decode_analog(info)
+        assert len(a['cell_mv']) == 16 and a['voltage'] == pytest.approx(52.14)
+        assert sum(a['cell_mv']) / 1000 == pytest.approx(a['voltage'], abs=0.02)
+        assert a['remaining_ah'] / a['full_ah'] * 100 == pytest.approx(a['soc'], abs=0.01)
+        assert a['current'] < -20 and a['status']['current'] & 0b10  # discharging bit
+    soc = {adr: decode_analog(r[13:13 + 198])['soc'] for adr, r in RS485_TRUNCATED.items()}
+    assert soc == pytest.approx({1: 50.99, 2: 42.11})
 
 
 # --- (a) request bytes ----------------------------------------------------------

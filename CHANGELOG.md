@@ -1,8 +1,22 @@
 ## [unreleased]
 
+* Fix: 2.23's `daly` connect could fail every time on a module that drops the first request after connecting, because the address it had learned was asked only once. The address is now asked again, a late reply still counts, the layout that answered is tried first on reconnect, and a connect where nothing answered keeps the subscribed layout instead of failing (#416).
+
+## [2.23]
+
+* Fix: 2.22's `daly` host-address fallback could get stuck on `0x40` for a module that only answers `0x80`, if a reply came in late, and it accepted a layout whose write characteristic didn't work. `daly` now settles the layout and address on connect with one request per address, using a different command for each, so a late reply can't be credited to the wrong one. Wired `daly_uart` no longer logs a BLE address switch on timeouts (#416).
+
+## [2.22]
+
 * Experimental `impedance_estimator` (off by default): estimates the per-cell resistance of LiFePO4 packs from sampled current and cell voltages and publishes it as a `Cell Resistance` sensor in mΩ; small packs may never draw the current steps it needs (doc/Cell Resistance.md).
+* The cell resistance estimator saves its state per BMS (`impedance_<name>.json`), so a restart keeps the collected windows instead of starting the warm-up again.
+* Experimental `soh_estimator` (off by default): estimates each LiFePO4 pack's present capacity from long rests and the charge counted between them, as `Qmax (est.)` and `SoH (est.)` sensors. It needs the per-device `capacity:` (the nameplate); the capacity the BMS reports is never used. With its current gates and OCV curve it publishes nothing yet; doc/SoH.md says why.
 * Experimental `pack_temp_estimator` (off by default): a `Pack Temp (RC est.)` sensor estimating the cell temperature from the MOSFET temperature and optional room/outdoor MQTT topics, for BMSes that report only a MOSFET temperature.
-* New wired type `braunpwr_uart` for BraunPWR packs with the KS48100 rack BMS (YD/T 1363, `>…\r` frames, 9600 baud), whose FC41D WiFi/BLE module keeps dropping the BLE link. Built from a user's working ESPHome config and the manufacturer's protocol PDF; untested on hardware (#403).
+* New wired type `braunpwr_uart` for BraunPWR packs with the KS48100 rack BMS, whose FC41D WiFi/BLE module keeps dropping the BLE link: a USB-TTL adapter on the module's header instead (YD/T 1363, `>…\r` frames, 9600 baud). Decoder checked against real reply frames (#403).
+* New `type: auto` for Bluetooth devices: batmon asks the device which protocol it speaks (`daly` A5, `daly2` Modbus, `jbd`, `jk`, `ant`) and logs the `type:` to set. It sends only read requests, accepts only a valid reply, and skips a device it can't confirm instead of guessing (#416).
+* Fix: `daly` never connected to Daly modules that refuse an empty write on `fff2` (GATT error 258): the refused wake-up write discarded the working `fff1/fff2` layout. Until its first reply, `daly` now also alternates the BLE host address between `0x80` and `0x40`, because this module was only seen answering `0x40` (#416).
+* Fix: `snoop` probing wrote its frames into SIG characteristics too, and through an ESPHome proxy that includes GAP Device Name, so a Daly module took the probe frame as its new name. It now probes vendor characteristics only (#416).
+* `daly2` timeouts now say to try `type: daly`: Daly modules that speak the classic `A5` protocol have the same `fff0` GATT layout and silently ignore Modbus requests (#416).
 * Fix: telemetry uploaded either a device's pack samples or its cell voltages, rarely both, because the two shared one 15 s slot. Each now has its own.
 
 ## [2.21]

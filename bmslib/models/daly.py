@@ -29,6 +29,18 @@ def calc_crc(message_bytes):
     return sum(message_bytes) & 0xFF
 
 
+def daly_reply_valid(buf: bytes, cmd: int) -> bool:
+    """True if `buf` holds one complete, valid A5 reply to command `cmd`: header,
+    a reply-side board number (requests carry 0x40/0x80, so an echo never passes),
+    command, length byte and checksum. Scans, so split or prefixed data works."""
+    for i in range(len(buf) - 12):
+        f = buf[i:i + 13]
+        if (f[0] == 0xA5 and 0x01 <= f[1] <= 0x10 and f[2] == cmd and f[3] == 0x08
+                and calc_crc(f[:12]) == f[12]):
+            return True
+    return False
+
+
 def daly_board_addr_byte(board: int) -> int:
     """Wire value of request byte 1 addressing Daly board number ``board`` (1-based).
 
@@ -114,6 +126,12 @@ class DalyBt(BtBms):
         # self._num_cells = 0
         self._states = None
         self._last_response = None
+        # BLE host-address byte, None = WIRE_ADDRESS (0x80). Some modules were only
+        # seen answering 0x40 (#416); connect() finds out which one is answered and
+        # keeps it for the next connect as the address to try first.
+        self._ble_addr_byte = None
+        self._layout = None  # (rx, tx) that answered the handshake last time
+        self._raw_rx: Optional[bytearray] = None  # raw notifications during that handshake
 
     async def get_states_cached(self, key):
         if not self._states:
@@ -123,6 +141,9 @@ class DalyBt(BtBms):
 
     def _notification_callback(self, _sender, data):
         RESP_LEN = 13
+
+        if self._raw_rx is not None:
+            self._raw_rx += data
 
         # split responses into chunks with length RESP_LEN
         responses = [data[i:i + RESP_LEN] for i in range(0, len(data), RESP_LEN)]
@@ -181,24 +202,86 @@ class DalyBt(BtBms):
              '0000ff02-0000-1000-8000-00805f9b34fb'),
         ]
 
-        for rx, tx, sx in CHARACTERISTIC_UUIDS:
+        # A layout is taken when a request on it is answered (_handshake); the one
+        # that answered last time is tried first. If none answers, connect() doesn't
+        # fail while a notify subscribed: it takes the remembered layout, else the
+        # first one that also accepted the empty write (2.21's choice), else the
+        # first that subscribed (#416 refuses the empty write), and leaves retrying
+        # to sampling and the usual reconnects.
+        layouts = list(CHARACTERISTIC_UUIDS)
+        if self._layout:
+            layouts.sort(key=lambda l: (l[0], l[1]) != self._layout)
+        subscribed = []  # (rx, tx, empty_write_ok)
+        for rx, tx, sx in layouts:
             try:
                 await self.client.start_notify(rx, self._notification_callback)
-                try:
-                    await self.client.write_gatt_char(sx, bytearray(b""))
-                except:
-                    await self.client.write_gatt_char(tx, bytearray(b""))
-                self.UUID_RX = rx
-                self.UUID_TX = tx
-                self.logger.debug("found rx uuid to be working: %s (tx %s, sx %s)", rx, tx, sx)
-                break
             except Exception as e:
                 self.logger.warning("tried rx/tx/sx uuids %s/%s/%s: %s", rx, tx, sx, e)
                 continue
+            empty_write_ok = True
+            try:
+                await self.client.write_gatt_char(sx, bytearray(b""))
+            except Exception:
+                try:
+                    await self.client.write_gatt_char(tx, bytearray(b""))
+                except Exception as e:
+                    # a module may refuse the empty write (GATT error 258 on fff2,
+                    # #416) and still answer real requests: let the handshake decide
+                    empty_write_ok = False
+                    self.logger.debug("empty write to %s refused: %s", tx, e)
+            addr = await self._handshake(tx)
+            if addr is not None:
+                self.UUID_RX, self.UUID_TX = rx, tx
+                if addr != self._ble_addr_byte or (rx, tx) != self._layout:
+                    self.logger.info('%s answers on %s with host address 0x%02x', self.name, tx, addr)
+                self._ble_addr_byte, self._layout = addr, (rx, tx)
+                return
+            subscribed.append((rx, tx, empty_write_ok))
+            await self.stop_notify(rx)
 
-        if not self.UUID_RX:
-            await enumerate_services(self.client, self.logger)
-            raise Exception("Notify characteristic (rx) not found")
+        if subscribed:
+            rx, tx, _ = next((l for l in subscribed if (l[0], l[1]) == self._layout), None) \
+                        or next((l for l in subscribed if l[2]), subscribed[0])
+            self.logger.warning('%s: no reply to 0x90/0x94 on any layout, using %s/%s with host address '
+                                '0x%02x', self.name, rx, tx, self._ble_addr_byte or (self.WIRE_ADDRESS << 4))
+            await self.client.start_notify(rx, self._notification_callback)
+            self.UUID_RX, self.UUID_TX = rx, tx
+            return
+
+        await enumerate_services(self.client, self.logger)
+        raise Exception("Notify characteristic (rx) not found")
+
+    HANDSHAKE_STEP = 2  # seconds per request; three requests per layout at most
+
+    async def _handshake(self, tx) -> Optional[int]:
+        """Which host address this module answers on `tx`, or None.
+
+        The address to try first only ever gets 0x90, the other one only 0x94.
+        Replies don't carry the host address, so the command is what ties a reply
+        to its address, and both are looked for the whole time: a late 0x90 still
+        counts for the first address. The first address is asked again at the end,
+        for a module that drops the very first request after connecting."""
+        first = self._ble_addr_byte or (self.WIRE_ADDRESS << 4)
+        second = 0x40 if first == 0x80 else 0x80
+        self._raw_rx = bytearray()
+        try:
+            for addr, cmd in ((first, 0x90), (second, 0x94), (first, 0x90)):
+                try:
+                    await self.client.write_gatt_char(tx, daly_command_message(cmd, addr_byte=addr))
+                except Exception as e:
+                    self.logger.debug('handshake write to %s failed: %s', tx, e)
+                    return None
+                t_end = time.monotonic() + self.HANDSHAKE_STEP
+                while time.monotonic() < t_end:
+                    buf = bytes(self._raw_rx)
+                    if daly_reply_valid(buf, 0x90):
+                        return first
+                    if daly_reply_valid(buf, 0x94):
+                        return second
+                    await asyncio.sleep(0.05)
+            return None
+        finally:
+            self._raw_rx = None
 
     async def disconnect(self):
         if self.UUID_RX:
@@ -208,6 +291,8 @@ class DalyBt(BtBms):
     def _build_request(self, command: int, extra="") -> bytearray:
         """Single place every outbound frame is built, so DalyUart can override
         the addressing / payload fill without duplicating the command list."""
+        if self._ble_addr_byte is not None:
+            return daly_command_message(command, extra=extra, addr_byte=self._ble_addr_byte)
         return daly_command_message(command, extra=extra, address=self.WIRE_ADDRESS)
 
     def _q_timeout_context(self) -> str:
