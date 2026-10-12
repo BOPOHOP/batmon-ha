@@ -1,0 +1,9 @@
+habluetooth
+bleak_esphome
+aioesphomeapi
+pyserial
+crcmod
+backoff
+paho-mqtt==2.1.0
+bluetooth-data-tools
+aiobmsble
