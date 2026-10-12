@@ -19,7 +19,8 @@ from bmslib.bms import DeviceInfo, BmsSample, MIN_VALUE_EXPIRY
 from bmslib.cache.mem import mem_cache_deco
 from bmslib.group import BmsGroup, GroupNotReady
 from bmslib.mqtt_util import publish_sample, is_none_or_nan, publish_cell_voltages, publish_temperatures, publish_hass_discovery, \
-    subscribe_switches, subscribe_set_soc, mqtt_single_out, publish_cell_resistance, publish_qmax
+    subscribe_switches, subscribe_set_soc, mqtt_single_out, publish_cell_resistance, publish_qmax, withdraw_qmax, \
+    QMAX_CLEAR_REPEAT_S
 from bmslib.pwmath import Integrator, DiffAbsSum, LHQ
 from bmslib.util import get_logger, summarize_exc
 
@@ -268,6 +269,9 @@ class BmsSampler:
             if soh_state:
                 self.qmax.restore(soh_state)
         self._qmax_saved = None
+        # A withdrawn estimate is kept cleared until a new one goes out: [why,
+        # when the last clear went through or None] (_withdraw_qmax)
+        self._qmax_clear: Optional[list] = None
 
         # pack_temp_estimator (off by default): one RC estimator per real pack,
         # all sharing the ambient cache. Runs without MQTT too (mqtt_single_out
@@ -673,6 +677,8 @@ class BmsSampler:
                 if not voltages and self.qmax.wants_voltages(sample.timestamp, current_native):
                     voltages = await cached_fetch_voltages(optional=True)
                 await self._feed_qmax(sample, current_native, voltages)
+            elif self.qmax is not None:
+                self._withdraw_qmax()  # disabled (also restored disabled): clear what an earlier run published
 
             # z_score = self.power_stats.z_score(sample.power)
             # if abs(z_score) > 12:
@@ -783,38 +789,49 @@ class BmsSampler:
             publish_cell_resistance(self.mqtt_client, device_topic=self.mqtt_topic_prefix, value_mohm=r)
 
     async def _qmax_temperature(self, sample: BmsSample):
-        """Best cell temperature known, None if none -- never a default. The
-        pack-temperature estimate if it runs, else the median BMS probe, else
-        the MOSFET, which is close to the cells at rest (the only time the
-        estimator uses it)."""
+        """(best cell temperature known or None, whether it is the MOSFET's):
+        qmax.best_temperature."""
+        from bmslib.qmax import best_temperature
         if self._pack_temp is not None and math.isfinite(self._pack_temp):
-            return self._pack_temp
+            return best_temperature(self._pack_temp, None, None)
         # sample.temperatures is only filled when a sink or a group wanted it
         temps = sample.temperatures or await self._fetch_temperatures_cached()
-        temps = sorted(t for t in (temps or []) if isinstance(t, (int, float)) and -40 < t < 100)
-        if temps:
-            return temps[len(temps) // 2]
-        mos = sample.mos_temperature
-        return mos if isinstance(mos, (int, float)) and -40 < mos < 100 else None
+        return best_temperature(None, temps, sample.mos_temperature)
 
     async def _feed_qmax(self, sample: BmsSample, current: float, voltages):
         est = self.qmax
         if est is None:
             return
         try:
-            temp = await self._qmax_temperature(sample)
-            from bmslib.qmax import charge_counter
-            counter, counter_src = charge_counter(sample.charge, sample.soc, sample.capacity)
-            r = est.add(sample.timestamp, current, voltages or None, temp=temp, capacity=sample.capacity,
-                        bms_charge=counter, charge_src=counter_src, bms_soc=sample.soc)
+            temp, temp_mos = await self._qmax_temperature(sample)
+            r = est.add_sample(sample, current, voltages, temp, temp_mos)
         except Exception as e:
             # an estimator bug must neither kill sampling nor keep publishing
             logger.error('%s: Qmax/SoH estimator failed, disabled: %s', self.bms.name, summarize_exc(e),
                          exc_info=True)
             est.disable('internal error', persistent=False)
-            return
+            r = None
         if r is not None:
+            self._qmax_clear = None  # a new estimate replaces the cleared one
             publish_qmax(self.mqtt_client, device_topic=self.mqtt_topic_prefix, res=r)
+        else:
+            self._withdraw_qmax()
+
+    def _withdraw_qmax(self):
+        """Clear what may no longer be published (the estimator says why, once)
+        and keep it cleared: again at the next sample while a publish fails,
+        and every QMAX_CLEAR_REPEAT_S until a new estimate goes out, for a Home
+        Assistant that missed it (rev9)."""
+        why = self.qmax.take_withdrawal() if self.qmax is not None else None
+        if why is not None:
+            logger.info('%s: Qmax/SoH cleared in Home Assistant: %s', self.bms.name, why)
+            self._qmax_clear = [why, None]
+        c = self._qmax_clear
+        now = time.time()
+        if c is None or (c[1] is not None and now - c[1] < QMAX_CLEAR_REPEAT_S):
+            return
+        if withdraw_qmax(self.mqtt_client, device_topic=self.mqtt_topic_prefix):
+            c[1] = now
 
     def publish_meters(self):
         device_topic = self.mqtt_topic_prefix

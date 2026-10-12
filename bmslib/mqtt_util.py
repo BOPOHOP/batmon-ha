@@ -183,13 +183,38 @@ def publish_cell_resistance(client, device_topic, value_mohm: float):
 
 # Qmax/SoH (bmslib/qmax.py) is published once per accepted segment -- weeks
 # apart at best -- and never refreshed. The entity expires with the estimate
-# itself: a year after the newest segment, the age limit of the median.
+# itself: a year after the newest segment, the age limit of the median. An
+# estimate that may no longer go out is withdrawn before that (withdraw_qmax).
 QMAX_EXPIRE_S = 365 * 86400
 
 # offset_drift_pct is the drift of the ASSUMED offset offset_assumed_a (a tuning
 # constant or the rest reading), not a bound on the error (bmslib/qmax.py).
+# anchors: what the newest segment ran between ('ocv->top': a rest near empty,
+# then a charge termination, doc/SoH.md); top_anchored: how many of the counted
+# segments used a top anchor, whose 100 % is full as the charger defines it.
 QMAX_ATTRIBUTES = ('segments', 'newest', 'limiting_cell', 'cell_spread_pct', 'min_dsoc', 'offset_assumed_a',
-                   'offset_drift_pct', 'capacity', 'capacity_source', 'plausibility_checked')
+                   'offset_drift_pct', 'capacity', 'capacity_source', 'plausibility_checked', 'anchors',
+                   'top_anchored')
+
+
+# A withdrawal is sent again this often for as long as nothing may be published.
+# Home Assistant restores an MQTT sensor's last state at its start (until
+# expire_after, a year here), so one that missed the withdrawal (it was down, or
+# the broker was) shows the old estimate again; an hour later it is gone. Not
+# retained: a retained value outlives the estimator in the broker (switched off,
+# the BMS removed) and comes back with every restart of Home Assistant.
+QMAX_CLEAR_REPEAT_S = 3600
+
+
+def withdraw_qmax(client, device_topic) -> bool:
+    """Clear Qmax and SoH in Home Assistant: an MQTT sensor takes the payload
+    "None" as unknown (homeassistant/components/mqtt/sensor.py, PAYLOAD_NONE).
+    Without it a withdrawn estimate stayed for QMAX_EXPIRE_S. False when a
+    publish failed (the caller tries again)."""
+    ok = [mqtt_single_out(client, f"{device_topic}/qmax_est/attributes", json.dumps({})),
+          mqtt_single_out(client, f"{device_topic}/qmax_est", "None"),
+          mqtt_single_out(client, f"{device_topic}/soh_est", "None")]
+    return all(x is not False for x in ok)  # (False: failed; an unchanged value is not skipped within an hour)
 
 
 def publish_qmax(client, device_topic, res: dict):

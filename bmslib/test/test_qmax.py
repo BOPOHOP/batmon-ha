@@ -17,6 +17,7 @@ therefore run on SYNTH, a synthetic curve with a steep top knee, through the
 same code.
 """
 import asyncio
+import bisect
 import csv
 import gzip
 import json
@@ -33,11 +34,27 @@ import pytest
 
 import bmslib.qmax as q
 from bmslib.bms import BmsSample
+import bmslib.mqtt_util as q_mqtt
 from bmslib.mqtt_util import publish_hass_discovery, publish_qmax
 from bmslib.sampling import BmsSampler
 
 T0 = 1.7e9
-CAPS = (100.0, 98.0, 102.0, 101.0)  # Ah per cell; the pack's Qmax is the limiting cell, 98
+CAPS = (100.0, 98.0, 102.0, 101.0)
+
+
+@pytest.fixture(autouse=True)
+def _no_top_anchors_on_synth(monkeypatch):
+    """The tests run on SYNTH, whose synthetic relaxed top knee puts a cell at
+    97 % SoC at 3424 mV: by the termination rule's real-LFP calibration
+    (TOP_CELL_MIN_MV) that is full, and every simulated charge end would add a
+    top anchor 3 % high. Top anchors are on only where a test asks for them
+    (the `top_anchors` fixture), on an LFP-like charge curve (LfpPack)."""
+    monkeypatch.setattr(q, 'TOP_ANCHORS', False)
+
+
+@pytest.fixture
+def top_anchors(monkeypatch):
+    monkeypatch.setattr(q, 'TOP_ANCHORS', True)  # Ah per cell; the pack's Qmax is the limiting cell, 98
 
 
 # ================================================================ simulator
@@ -356,12 +373,14 @@ def test_a_burst_of_impossible_currents_ends_the_segment():
 
 def test_calibration_bridging_every_glitch_publishes_the_garbled_frames_between_them(monkeypatch):
     """Partly redundant, and said so: in this burst every caught frame has a
-    garbled neighbour, so with only the isolation rule off the neighbour rule
-    still ends the segment. With both off the garbage is counted."""
+    garbled neighbour and comes before the last one's neighbourhood is
+    complete, so with only the isolation rule off the neighbour rules still
+    end the segment. With all of them off the garbage is counted."""
     monkeypatch.setattr(q, 'GLITCH_ISOLATION_S', -1.0)  # every rejection counts as isolated
     est, _ = run(_glitch_burst(full_cycles(n=3).rows))
     assert all(s['dq'] > 0 for s in est.segments) and est.counts['current_implausible_neighbours'] >= 3
     monkeypatch.setattr(q, 'GLITCH_AGREE_REL', math.inf)
+    monkeypatch.setattr(q.QmaxEstimator, '_glitch_ends', lambda self, t: None)
     est, pub = run(_glitch_burst(full_cycles(n=3).rows))
     dis = [s for s in est.segments if s['dq'] < 0]
     assert dis, 'scenario is harmless'
@@ -427,32 +446,184 @@ def test_calibration_without_the_neighbour_rule_the_garbled_frames_are_counted(m
 
 def test_monotone_in_how_far_a_glitch_neighbour_is_off():
     """A 50 A discharge; the sample after the caught glitch reads 50 + d A.
-    Up to 16.7 A (25 % of the larger, 66.7 A) the hole is bridged; beyond,
-    never again -- up to
-    the far tail, where the neighbour is itself above the bound (a burst)."""
+    Up to 12.5 A (25 % of the local level, the neighbourhood's median 50 A)
+    the hole is bridged; beyond, never again -- up to the far tail, where the
+    neighbour is itself above the bound (a burst)."""
     def accepted(d):
         rows = Pack().rest().run(50.0, 3600 * 88 / 50).rest().end().rows
         return _accepts(_glitch_with_neighbours(rows, 1, value=50.0 + d))
-    verdicts = [accepted(d) for d in (0.0, 5.0, 16.0, 17.0, 50.0, 400.0, 3000.0)]
+    verdicts = [accepted(d) for d in (0.0, 5.0, 12.0, 13.0, 16.0, 50.0, 400.0, 3000.0)]
     _monotone(verdicts)
     assert verdicts[:3] == [True] * 3 and not verdicts[3]
 
 
-def _spaced_glitches(rows, spacing_s=120.0, n_garbled=4, value=450.0):
+def _glitch_symmetric(rows, k, value=450.0, every_load=True):
+    """Fourth review, finding 3: one caught glitch in the middle of every load
+    (charge and discharge, or discharges only), and k garbled frames on BOTH
+    sides of it that read `value` A in the load's direction. The two samples
+    beside the hole then agree with each other."""
+    out = list(rows)
+    j, n = 0, len(rows)
+    while j < n:
+        if abs(rows[j][1]) > 30 and (every_load or rows[j][1] > 0):
+            sgn = 1.0 if rows[j][1] > 0 else -1.0
+            e = j
+            while e < n and abs(rows[e][1]) > 30:
+                e += 1
+            m = (j + e) // 2
+            t, _, v, temp = out[m]
+            out[m] = (t, sgn * 3553.5, v, temp)
+            for b in list(range(1, k + 1)) + [-x for x in range(1, k + 1)]:
+                t, _, v, temp = out[m + b]
+                out[m + b] = (t, sgn * value, v, temp)
+            j = e
+        j += 1
+    return out
+
+
+@pytest.mark.parametrize('value', [450.0, 300.0])
+@pytest.mark.parametrize('k', [1, 2, 4])
+def test_garbled_frames_on_both_sides_of_a_glitch_end_the_segment(k, value):
+    """The review published 101.2 / 103.7 / 108.6 Ah (450 A) and 99.8 /
+    101.4 / 104.4 Ah (300 A) for 97.5: the samples either side of the hole
+    agreed with each other. The 5 either side do not agree with their level."""
+    est, pub = run(_glitch_symmetric(full_cycles(n=3).rows, k, value))
+    assert est.counts['current_implausible_neighbours'] == 6 and est.counts['current_implausible_burst'] == 0
+    assert not est.segments and pub == []  # every load had one: nothing left to publish
+
+
+def test_calibration_with_only_the_two_neighbours_the_symmetric_garbage_is_published(monkeypatch):
+    """GLITCH_NB_N = 1 is the old rule: the sample before and the one after."""
+    monkeypatch.setattr(q, 'GLITCH_NB_N', 1)
+    rows = full_cycles(n=3).rows
+    for k, value, want in ((1, 450.0, 101.2), (2, 450.0, 103.7), (4, 450.0, 108.6), (4, 300.0, 104.4)):
+        est, pub = run(_glitch_symmetric(rows, k, value))
+        assert est.counts['current_implausible_neighbours'] == 0 and pub, 'scenario is harmless'
+        assert pub[-1]['qmax'] == pytest.approx(want, abs=0.2) and pub[-1]['plausibility_checked'], (k, value)
+
+
+def test_monotone_in_garbled_frames_either_side_of_a_glitch():
+    """0 is a clean isolated glitch (bridged); 1 to GLITCH_NB_N - 1 garbled
+    frames either side are refused. From GLITCH_NB_N on, the window is all
+    garbage that agrees with itself, which is a real load pulse to any rule
+    that sees only the current, and the same run without the caught frame
+    passes every rule: the documented limit, not a verdict that flips back
+    within the range the rule covers. Magnitude, to the far tail: refused
+    from just beyond the tolerance up to a neighbour above the bound."""
+    def accepted(k, value=450.0):
+        rows = Pack().rest().run(50.0, 3600 * 88 / 50).rest().end().rows
+        return _accepts(_glitch_symmetric(rows, k, value) if k else rows)
+    verdicts = [accepted(k) for k in range(q.GLITCH_NB_N)]
+    _monotone(verdicts)
+    assert verdicts == [True] + [False] * (q.GLITCH_NB_N - 1)
+    _monotone([accepted(1, 50.0 + d) for d in (0.0, 12.0, 13.0, 100.0, 400.0, 3000.0)])
+
+
+def _glitch_at_restart(at_glitch):
+    """A caught glitch 200 samples into every discharge with 3 garbled 450 A
+    frames after it; batmon restarts (full state) right after the glitch
+    (at_glitch False: the garbage comes after the restart) or with the glitch
+    as the first sample after the restart (at_glitch True)."""
+    p = Pack().rest()
+    for _ in range(3):
+        p.run(50.0, 3600 * 88 / 50).rest()
+        p.run(-50.0, 3600 * 88 / 50).rest()
+    p.end()
+    rows, cuts = list(p.rows), []
+    for s in [k for k in range(1, len(rows)) if rows[k][1] > 30 and rows[k - 1][1] < 5]:
+        m = s + 200
+        t, _, v, temp = rows[m]
+        rows[m] = (t, 3553.5, v, temp)
+        for b in range(1, 4):
+            t, _, v, temp = rows[m + b]
+            rows[m + b] = (t, 450.0, v, temp)
+        cuts.append(m if at_glitch else m + 1)
+    return _split_run(rows, cuts, **bms(p))
+
+
+@pytest.mark.parametrize('at_glitch', [False, True])
+def test_a_glitch_next_to_a_restart_is_judged_by_its_whole_neighbourhood(at_glitch):
+    """Fourth review, finding 5a: the open decision is saved and restored
+    (otherwise the garbage just after a restart counted, 101.8 Ah), and a
+    glitch that is the first sample after a restart opens one too."""
+    est, _ = _glitch_at_restart(at_glitch)
+    assert est.counts['restart_unverified'] == 0 and est.counts['current_implausible_neighbours'] == 3
+    assert not any(s['dq'] < 0 for s in est.segments)
+
+
+@pytest.mark.parametrize('at_glitch', [False, True])
+def test_calibration_without_the_open_decision_across_a_restart_the_garbage_is_counted(at_glitch, monkeypatch):
+    orig = q.QmaxEstimator._restore
+
+    def forget(self, st):
+        orig(self, st)
+        self._glitch_nb = None  # finding 5a's first break
+    monkeypatch.setattr(q.QmaxEstimator, '_restore', forget)
+    if at_glitch:  # the second: a glitch right after a restart opens nothing
+        add = q.QmaxEstimator.add
+
+        def no_open(self, t, current, *a, **k):
+            resumed = self._resumed
+            r = add(self, t, current, *a, **k)
+            if resumed and abs(current) > 1000:
+                self._glitch_nb = None
+            return r
+        monkeypatch.setattr(q.QmaxEstimator, 'add', no_open)
+    est, _ = _glitch_at_restart(at_glitch)
+    dis = [s['qmax'] for s in est.segments if s['dq'] < 0]
+    assert est.counts['current_implausible_neighbours'] == 0 and dis, 'scenario is harmless'
+    assert all(x == pytest.approx(101.8, abs=0.2) for x in dis)
+
+
+def test_a_gap_ends_a_glitchs_open_decision():
+    """A glitch, then a gap: the gap ends the epoch, and the samples after it
+    (here a load that starts within 5 samples) are not judged against the
+    ones before the glitch; that would end the next epoch for nothing."""
+    est = _fresh()
+    for k in range(10):
+        est.add(T0 + 10 * k, 0.0, None)
+    est.add(T0 + 100, 3553.5, None)
+    for k in range(10):
+        est.add(T0 + 1000 + 10 * k, 50.0 if k > 1 else 0.0, None)
+    assert est.counts['gap'] == 1 and est.counts['current_implausible_neighbours'] == 0 and est.epoch == 1
+
+
+def test_a_clean_glitch_right_after_a_restart_is_still_bridged():
+    """The samples before the restart are saved too (the state's `recent`):
+    without them the neighbourhood is unevaluable and the segment ends."""
+    p = Pack().rest()
+    for _ in range(3):
+        p.run(50.0, 3600 * 88 / 50).rest()
+        p.run(-50.0, 3600 * 88 / 50).rest()
+    p.end()
+    rows, cuts = list(p.rows), []
+    for s in [k for k in range(1, len(rows)) if rows[k][1] > 30 and rows[k - 1][1] < 5]:
+        t, _, v, temp = rows[s + 200]
+        rows[s + 200] = (t, 3553.5, v, temp)
+        cuts.append(s + 200)
+    est, _ = _split_run(rows, cuts, **bms(p))
+    assert est.counts['current_implausible_neighbours'] == 0 and len(est.segments) == 5
+    est, _ = _split_run(rows, cuts, after_restore=lambda e: e._recent.clear(), **bms(p))
+    assert est.counts['current_implausible_neighbours'] == 3  # unevaluable is no agreement
+
+
+def _spaced_glitches(rows, spacing_s=240.0, n_garbled=4, value=450.0):
     """In the middle of every discharge (10 s cadence): a caught glitch, n
-    garbled frames of `value` A from 30 s after it, and a second caught
-    glitch spacing_s after the first. The samples beside each glitch are
-    clean, so the neighbour rule bridges each one; only the isolation window
-    sees that there were two."""
+    garbled frames of `value` A from GLITCH_NB_N + 1 samples after it, and a
+    second caught glitch spacing_s after the first. The GLITCH_NB_N samples
+    either side of each glitch are clean, so the neighbourhood rule bridges
+    each one; only the isolation window sees that there were two."""
     out = list(rows)
     j, n, step = 0, len(rows), int(round(spacing_s / 10.0))
+    first = q.GLITCH_NB_N + 1
+    assert not n_garbled or first + n_garbled + q.GLITCH_NB_N <= step, 'the garbage would be beside a glitch'
     while j < n:
         if rows[j][1] > 30:
             e = j
             while e < n and rows[e][1] > 30:
                 e += 1
             m = (j + e) // 2 - step // 2
-            for b in [0, step] + list(range(3, 3 + n_garbled)):
+            for b in [0, step] + list(range(first, first + n_garbled)):
                 t, _, v, temp = out[m + b]
                 out[m + b] = (t, 3553.5 if b in (0, step) else value, v, temp)
             j = e
@@ -461,9 +632,10 @@ def _spaced_glitches(rows, spacing_s=120.0, n_garbled=4, value=450.0):
 
 
 def test_two_glitches_minutes_apart_end_the_segment():
-    """The isolation window, on its own: two caught glitches 120 s apart with
-    garbled frames between them but not beside them. The burst test spaces
-    its frames 10 s apart, so a window cut to 60 s passed it."""
+    """The isolation window, on its own: two caught glitches 240 s apart with
+    garbled frames between them but not within GLITCH_NB_N samples of either.
+    The burst test spaces its frames 10 s apart, so a window cut to 60 s
+    passed it."""
     est, pub = run(_spaced_glitches(full_cycles(n=3).rows))
     assert est.counts['current_implausible_burst'] == 3 and est.counts['current_implausible_neighbours'] == 0
     assert all(s['dq'] > 0 for s in est.segments)
@@ -476,16 +648,87 @@ def test_calibration_with_a_60_s_isolation_window_the_garbage_between_is_counted
     dis = [s['qmax'] for s in est.segments if s['dq'] < 0]
     assert dis, 'scenario is harmless'
     assert all(x / 97.5 - 1 > 0.04 for x in dis)  # 4 x 400 A x 10 s = 4.4 Ah of garbage: 102.4 Ah
+    assert est.counts['current_implausible_neighbours'] == 0  # nothing else saw it
 
 
 def test_monotone_in_glitch_spacing():
     """Closer glitches are worse: bridged beyond 300 s, and never again below."""
     def accepted(spacing):
         rows = Pack().rest().run(50.0, 3600 * 88 / 50).rest().end().rows
-        return _accepts(_spaced_glitches(rows, spacing_s=spacing))
+        return _accepts(_spaced_glitches(rows, spacing_s=spacing, n_garbled=0))
     verdicts = [accepted(x) for x in (900.0, 600.0, 310.0, 290.0, 120.0, 60.0, 20.0)]
     _monotone(verdicts)
     assert verdicts[:3] == [True] * 3 and not verdicts[3]
+
+
+def _glitch_in_open_window(rows, n_garbled):
+    """Rev8, finding 1: in the middle of every discharge a caught glitch, its
+    next 4 samples 80 s apart (a slow BLE stretch), a second caught glitch
+    330 s after the first (no burst), one good sample, then n_garbled frames
+    of 450 A 10 s apart."""
+    out, j, n = [], 0, len(rows)
+    while j < n:
+        if rows[j][1] > 30:
+            e = j
+            while e < n and rows[e][1] > 30:
+                e += 1
+            m = (j + e) // 2
+            out.extend(rows[j:m])
+            t, _, v, temp = rows[m]
+            out.append((t, 3553.5, v, temp))
+            k = m
+            for _ in range(4):
+                k += 8
+                out.append(rows[k])
+            k += 1
+            t, _, v, temp = rows[k]
+            out.append((t, 3553.5, v, temp))
+            k += 1
+            out.append(rows[k])
+            for _ in range(n_garbled):
+                k += 1
+                t, _, v, temp = rows[k]
+                out.append((t, 450.0, v, temp))
+            out.extend(rows[k + 1:e])
+            j = e
+            continue
+        out.append(rows[j])
+        j += 1
+    return out
+
+
+@pytest.mark.parametrize('n_garbled', [0, 4, 8])
+def test_a_second_glitch_before_the_first_ones_neighbourhood_is_complete_ends_the_segment(n_garbled):
+    """The review published 102.4 / 107.3 Ah for 97.5 with 4 / 8 garbled
+    frames: the second glitch shared the first one's open decision, which
+    closed one good sample after it."""
+    est, pub = run(_glitch_in_open_window(full_cycles(n=3).rows, n_garbled))
+    assert est.counts['current_implausible_neighbours'] == 3 and est.counts['current_implausible_burst'] == 0
+    assert all(s['dq'] > 0 for s in est.segments)
+    assert pub and all(r['qmax'] == pytest.approx(98.0, rel=0.01) for r in pub)
+
+
+def test_calibration_judged_by_the_first_ones_decision_the_garbage_after_the_second_is_counted(monkeypatch):
+    def shared(self, t):
+        burst = self._t_glitch is not None and 0 <= t - self._t_glitch <= q.GLITCH_ISOLATION_S
+        if self._glitch_nb is not None and not burst:
+            self._keep = self._glitch_nb  # the old code left the open decision as it was
+        return 'current_implausible_burst' if burst else None
+    add = q.QmaxEstimator.add
+
+    def keep(self, *a, **k):
+        r = add(self, *a, **k)
+        if getattr(self, '_keep', None) is not None:
+            self._glitch_nb, self._keep = self._keep, None
+        return r
+    monkeypatch.setattr(q.QmaxEstimator, '_glitch_ends', shared)
+    monkeypatch.setattr(q.QmaxEstimator, 'add', keep)
+    rows = full_cycles(n=3).rows
+    for n_garbled, want in ((4, 102.4), (8, 107.3)):
+        est, _ = run(_glitch_in_open_window(rows, n_garbled))
+        dis = [s['qmax'] for s in est.segments if s['dq'] < 0]
+        assert dis and est.counts['current_implausible_neighbours'] == 0, 'scenario is harmless'
+        assert all(x == pytest.approx(want, abs=0.2) for x in dis), (n_garbled, dis)
 
 
 def test_calibration_without_the_current_bound_the_glitches_are_published(monkeypatch):
@@ -511,11 +754,14 @@ def test_the_bms_reported_capacity_is_never_the_reference(bms_cap):
     denominator, and a healthy 98 Ah pack read SoH 108.3 / 88.6 / 81.3 /
     65.0 % with the BMS set to 90 / 110 / 120 / 150 Ah. Now nothing goes out
     without the option, and with it the option is the reference whatever the
-    BMS says."""
+    BMS says (150 is more than 1.25x the option: nothing at all)."""
     est, pub = _with_bms_capacity(full_cycles().rows, bms_cap)
     assert pub == [] and not est.segments and est.capacity() == (None, None)
     assert est.pair_reasons['no_capacity'] >= 4 and 'accepted' not in est.pair_reasons
     est, pub = _with_bms_capacity(full_cycles().rows, bms_cap, cap=100.0)
+    if bms_cap > q.CAPACITY_MISMATCH_MAX * 100.0:
+        assert pub == [] and est.segments
+        return
     assert pub[-1]['capacity'] == 100.0 and pub[-1]['capacity_source'] == 'option'
     assert pub[-1]['soh'] == pytest.approx(pub[-1]['qmax']) == pytest.approx(97.5, abs=0.2)
 
@@ -525,6 +771,110 @@ def test_calibration_the_bms_capacity_as_the_reference_publishes_its_setting_as_
     option. The same healthy pack's SoH then follows the BMS setting."""
     sohs = {c: run(full_cycles().rows, cap=c)[1][-1]['soh'] for c in (90.0, 150.0)}
     assert sohs[90.0] == pytest.approx(108.3, abs=0.2) and sohs[150.0] == pytest.approx(65.0, abs=0.2)
+
+
+@pytest.mark.parametrize('bms_cap', [100.0, 99.0])
+def test_a_bank_capacity_as_the_option_is_not_published(bms_cap, caplog):
+    """Fourth review, finding 4: a 100 Ah pack in a bank of two, the option
+    set to the bank's 200 Ah. 97.5 Ah is inside 0.4-1.2 x 200, and SoH 48.8 %
+    went out with the plausibility check passed. The BMS reports 100: the two
+    differ by more than 1.25x, nothing is published, and the log names both."""
+    with caplog.at_level('WARNING'):
+        est, pub = _with_bms_capacity(full_cycles(n=3).rows, bms_cap, cap=200.0)
+    assert pub == []
+    assert len(est._counted()) == 5 and est.result() is None
+    assert 'capacity option is 200 Ah and the BMS reports %g Ah' % bms_cap in caplog.text
+
+
+def test_calibration_without_a_bms_capacity_the_bank_capacity_publishes_half_the_soh():
+    """No BMS figure, no check (as before), and the same run publishes the
+    review's 48.8 %; so does one with the check's factor out of reach."""
+    est, pub = _with_bms_capacity(full_cycles(n=3).rows, None, cap=200.0)
+    assert pub, 'scenario is harmless'
+    assert pub[-1]['soh'] == pytest.approx(48.8, abs=0.2) and pub[-1]['plausibility_checked']
+
+
+def test_calibration_with_the_mismatch_factor_out_of_reach_the_bank_capacity_is_published(monkeypatch):
+    monkeypatch.setattr(q, 'CAPACITY_MISMATCH_MAX', math.inf)
+    est, pub = _with_bms_capacity(full_cycles(n=3).rows, 100.0, cap=200.0)
+    assert pub and pub[-1]['soh'] == pytest.approx(48.8, abs=0.2)
+
+
+def test_monotone_in_how_far_the_option_is_from_the_bms_capacity():
+    """Published up to 1.25x either way, never again beyond, to the far tail.
+    (Up: the option 100 against a BMS that reports less; down: more.)"""
+    rows = full_cycles(n=3).rows
+    ratios = (1.0, 1.2, 1.25, 1.26, 1.5, 2.0, 10.0, 1e6)
+    up = [bool(_with_bms_capacity(rows, 100.0 / r, cap=100.0)[1]) for r in ratios]
+    down = [bool(_with_bms_capacity(rows, 100.0 * r, cap=100.0)[1]) for r in ratios]
+    for v in (up, down):
+        _monotone(v)
+        assert v[:3] == [True] * 3 and not v[3]
+
+
+@pytest.mark.parametrize('option', [140.0, 150.0, 128.6])
+def test_an_option_set_for_an_unequal_bank_is_not_published(option):
+    """Rev8, finding 3: the 100 Ah pack (BMS 100) with the option at 140 /
+    150 went out as SoH 69.7 / 65.0 %, plausibility checked; 128.6 is the
+    280 + 100 Ah bank's 380 seen from its 280 Ah pack (1.36x)."""
+    est, pub = _with_bms_capacity(full_cycles(n=3).rows, 100.0, cap=option)
+    assert pub == [] and len(est._counted()) == 5
+
+
+def test_an_option_within_1_25x_of_the_bms_figure_still_publishes_its_soh():
+    """The documented limit: 120 for a 100 Ah pack whose BMS reports 100."""
+    est, pub = _with_bms_capacity(full_cycles(n=3).rows, 100.0, cap=120.0)
+    assert pub and pub[-1]['soh'] == pytest.approx(81.3, abs=0.2)
+
+
+def test_calibration_with_the_mismatch_factor_at_1_5_an_unequal_bank_is_published(monkeypatch):
+    monkeypatch.setattr(q, 'CAPACITY_MISMATCH_MAX', 1.5)
+    for option, want in ((140.0, 69.7), (150.0, 65.0), (128.6, 75.8)):
+        est, pub = _with_bms_capacity(full_cycles(n=3).rows, 100.0, cap=option)
+        assert pub, 'scenario is harmless'
+        assert pub[-1]['soh'] == pytest.approx(want, abs=0.2) and pub[-1]['plausibility_checked']
+
+
+def test_the_bms_capacity_is_the_median_of_hourly_readings():
+    """The legacy Daly derivation swings near empty: odd readings do not
+    refuse, readings that persist for half of BMS_CAP_N hours do."""
+    est = _fresh()
+    n = q.BMS_CAP_N
+    for k in range(n):
+        c = 267.0 if k % 4 == 3 else 100.0
+        est.add(T0 + 3600 * k, 1.0, None, capacity=c)
+        assert est.bms_capacity() == 100.0 and est.capacity_mismatch() is None  # also right after a 267
+    for k in range(n, n + n // 2 + 1):
+        est.add(T0 + 3600 * k, 1.0, None, capacity=267.0)
+    assert est.capacity_mismatch() == (100.0, 267.0)
+    t1 = T0 + 3600 * (n + n // 2)
+    for k in range(1, 10):  # within the hour: no new reading
+        est.add(t1 + 60 * k, 1.0, None, capacity=100.0)
+    assert len(est._bms_caps) == n and est.bms_capacity() == 267.0
+
+
+def test_the_bms_capacity_is_read_once_an_hour_not_every_sample():
+    """Rev8 (M10): taking every sample's reading passed every test. Half an
+    hour of a swinging derived figure (legacy Daly near empty) at 10 s
+    cadence fills the deque with it then; read once an hour it is one of
+    BMS_CAP_N."""
+    est = _fresh()
+    for k in range(q.BMS_CAP_N):
+        est.add(T0 + 3600 * k, 1.0, None, capacity=100.0)
+    t1 = T0 + 3600 * (q.BMS_CAP_N - 1)
+    for k in range(1, 181):
+        est.add(t1 + 10 * k, 1.0, None, capacity=267.0)
+    assert est.bms_capacity() == 100.0 and est.capacity_mismatch() is None
+
+
+def test_the_sampler_passes_the_bms_capacity_to_the_check():
+    """The precondition in the real call path: what BmsSample says, set or
+    derived, reaches the check (never the reference)."""
+    s, _ = _run_sampler(2, bms=_Bms(capacity=100.0), soh_estimator=True, design_capacity=200.0)
+    assert s.qmax.bms_capacity() == 100.0 and s.qmax.capacity_mismatch() == (200.0, 100.0)
+    assert s.qmax.capacity() == (200.0, 'option')
+    s, _ = _run_sampler(2, bms=_DalyDerived(), soh_estimator=True, design_capacity=280.0)
+    assert s.qmax.bms_capacity() == 267 and s.qmax.capacity_mismatch() is None
 
 
 def test_without_the_option_qmax_alone_is_not_published_either():
@@ -1287,24 +1637,36 @@ def _via_json(state):
     return json.loads(json.dumps(state))
 
 
-def _fresh(cap=100.0):
-    est = q.QmaxEstimator('p', design_capacity=cap, curve=SYNTH)
+def _fresh(cap=100.0, curve=SYNTH):
+    est = q.QmaxEstimator('p', design_capacity=cap, curve=curve)
     est._log_summary = lambda: None
     return est
 
 
-def _split_run(rows, cuts, full=True, cap=100.0, charge=None, src=None, soc=None, after_restore=None):
-    est, pub = _fresh(cap), []
+def _split_run(rows, cuts, full=True, cap=100.0, charge=None, src=None, soc=None, after_restore=None, curve=SYNTH):
+    est, pub = _fresh(cap, curve), []
     for a, b in zip([0] + cuts, cuts + [len(rows)]):
         _, p = run(rows[a:b], est, charge=charge, src=src, soc=soc)
         pub += p
         if b < len(rows):
             st = _via_json(est.get_state(full=full))
-            est = _fresh(cap)
+            est = _fresh(cap, curve)
             assert est.restore(st)
             if after_restore:
                 after_restore(est)
     return est, pub
+
+
+def _seen_fuller(p, by=1.0, n=10):
+    """The BMS's counter read `by` Ah more for the first n samples: it has
+    been seen fuller than the tops of the cycles that follow (the pack was
+    charged further once). Without that, a counter back at its highest
+    reading may be held at its full end, and a restart there ends the
+    segment (test_a_counter_back_at_its_highest_reading_is_no_evidence)."""
+    charge = dict(p.charge)
+    for t, _, _, _ in p.rows[:n]:
+        charge[t] = round(charge[t] + by, 3)
+    return dict(charge=charge, soc=p.soc_bms)
 
 
 def test_full_state_continues_exactly_where_it_stopped():
@@ -1314,10 +1676,10 @@ def test_full_state_continues_exactly_where_it_stopped():
     (test_a_restart_before_the_counter_has_moved_ends_the_segment)."""
     p = full_cycles(n=2, dt=7.0)
     rows = p.rows
-    whole, pub_whole = run(rows, **bms(p))
+    whole, pub_whole = run(rows, **_seen_fuller(p))
     n = len(rows)
     cuts = [n // 7, n // 5 + 1, n // 3 + 2, n // 2 + 3, (4 * n) // 5 + 1]  # inside rests, loads and open bins
-    split, pub_split = _split_run(rows, cuts, **bms(p))
+    split, pub_split = _split_run(rows, cuts, **_seen_fuller(p))
     assert split.counts['restart_unverified'] == 0
     assert pub_whole and pub_split == pub_whole
     assert [s['q_cells'] for s in split.segments] == [s['q_cells'] for s in whole.segments]
@@ -1327,8 +1689,10 @@ def test_full_state_continues_exactly_where_it_stopped():
 def _attrs(est):
     out = {}
     for k, v in vars(est).items():
-        if k in ('_log_summary', '_lock', '_resumed'):
-            continue  # the test stub; a lock is not state; a restored estimator knows it was restarted
+        if k in ('_log_summary', '_lock', '_resumed', '_cap_warned', '_out', '_started', '_withdraw') \
+                or k.startswith('_top_'):
+            continue  # the test stub; a lock is not state; a restored estimator knows it was restarted; a log-once
+            # flag; what this process published; a charge in progress (not saved: a restart costs its top anchor)
         if isinstance(v, deque):
             v = list(v)
         out[k] = v
@@ -1547,16 +1911,283 @@ def test_calibration_without_the_stop_check_a_held_counter_publishes_the_hidden_
         assert all(x == pytest.approx(want, abs=0.3) for x in chg) and pub[-1]['plausibility_checked']
 
 
-def _resume_at(soc0=50.0, soc1=50.0, c1_off=0.0, cfull0=None, cfull1=None, c0=50.0):
-    """A 10 A discharge, the counter in 0.1 Ah steps ending at c0 with the BMS
-    reading soc0 and reporting cfull0; restart; the first sample 36 s later
-    reads c0 - 0.1 + c1_off, soc1, cfull1. Returns restart_unverified."""
+def _drive(coro):
+    """Run a coroutine that never suspends (BmsSampler._feed_qmax with the
+    temperatures in the sample) without an event loop per sample."""
+    try:
+        coro.send(None)
+    except StopIteration as e:
+        return e.value
+    raise AssertionError('the coroutine waited for something')
+
+
+def _int_soc_top(hidden, ratio, aged=False, raw_soc=True, after_restore=None, same_top=False):
+    """The fourth review's finding 1, through the real call path. The third
+    review's held counter (_pinned_top, the counter at its full end at the
+    shutdown), read by a driver that reports an INTEGER SoC next to a
+    remaining charge that tops out at its learnt full capacity, and as its
+    capacity the design value, `ratio` x that full end higher (supervolt:
+    remainingAh tops out at completeAh, capacity=designedAh). BmsSample
+    replaces the integer SoC by charge / capacity: 100 % reads 97 % at ratio
+    0.97. aged: the driver also reports the learnt full end as aged_capacity
+    (supervolt does). raw_soc False: the sampler does not pass the SoC as
+    reported (calibration). same_top: the counter's full end is the same in
+    every cycle, as a learnt full capacity is (in _pinned_top it moves down by
+    the hidden charge each cycle, so it is never a reading held before): from
+    each bottom rest on, where such a BMS re-learns its empty end, the counter
+    reads as if the charge hidden at its last stop had been counted. Each row is built into a BmsSample as the driver
+    does and fed through BmsSampler._feed_qmax; each restart is a new sampler
+    restored from the saved state, as main.py does. Returns (estimator,
+    published Qmax values)."""
+    rows, cuts, charge, _ = _pinned_top(hidden, headroom=0.0)
+    ends = [charge[rows[k][0]] for k in cuts]  # where the counter is held at each restart
+    if same_top:
+        top = charge[rows[0][0]]
+        starts = [j for j in range(1, len(rows)) if rows[j][1] < -30 and rows[j - 1][1] > -5]  # charges
+        charge = dict(charge)
+        for j, (t, _, _, _) in enumerate(rows):
+            k = bisect.bisect_right(starts, j) - 1
+            if k >= 0:
+                charge[t] = round(charge[t] + top - ends[k], 3)
+        ends = [top] * len(ends)
+    pub = []
+
+    def sampler(state=None):
+        s = BmsSampler(_Bms(), mqtt_client=None, dt_max_seconds=120, expire_after_seconds=60, soh_estimator=True,
+                       design_capacity=100.0, soh_state=state)
+        s.qmax.curve = SYNTH
+        s.qmax._log_summary = lambda: None
+        add = s.qmax.add
+
+        def published(*a, **k):  # what _feed_qmax hands to publish_qmax
+            if not raw_soc:
+                k.pop('bms_soc_raw')
+            r = add(*a, **k)
+            if r is not None:
+                pub.append(r['qmax'])
+            return r
+        s.qmax.add = published
+        return s
+
+    s = sampler()
+    for a, b in zip([0] + cuts, cuts + [len(rows)]):
+        for j in range(a, b):
+            t, i, v, temp = rows[j]
+            full = ends[min(bisect.bisect_left(cuts, j), len(ends) - 1)]  # the end its next stop is at
+            # the design capacity it reports is a fixed figure, ratio x the first full end
+            smp = BmsSample(voltage=53.0, current=i, charge=charge[t], capacity=round(ends[0] / ratio, 2),
+                            soc=int(round(min(100.0, 100.0 * charge[t] / full))), temperatures=[temp], timestamp=t,
+                            aged_capacity=full if aged else math.nan)
+            _drive(s._feed_qmax(smp, i, v))
+        if b < len(rows):
+            s = sampler(_via_json(s.qmax.get_state(full=True)))
+            if after_restore:
+                after_restore(s.qmax)
+    return s.qmax, pub
+
+
+def test_an_integer_soc_replaced_by_charge_over_capacity_reads_full_as_97_percent():
+    """The precondition: BmsSample replaces it, and keeps what was reported."""
+    s = BmsSample(voltage=53.0, current=0.0, charge=93.0, capacity=100.0, soc=100)
+    assert s.soc == 93.0 and s.soc_reported == 100 and 'soc_reported' not in s.values()
+
+
+@pytest.mark.parametrize('ratio', [1.0, 0.99, 0.97, 0.95, 0.90])
+@pytest.mark.parametrize('hidden', [3.0, 6.0, 10.0])
+def test_a_counter_held_below_the_reported_capacity_is_no_evidence(hidden, ratio):
+    """Fourth review, finding 1: at ratio <= 0.97 the derived SoC (97 %) and
+    the counter (0.97 x the reported capacity) passed both stop checks, and
+    95.0 / 91.7 / 87.3 Ah went out for 98 again. The driver's SoC said 100 %,
+    and the counter is at the highest reading it has held."""
+    est, pub = _int_soc_top(hidden, ratio)
+    assert est.counts['restart_unverified'] == 3
+    assert not any(s['dq'] > 0 for s in est.segments)  # the charges across the restarts
+    assert pub and all(x == pytest.approx(97.5, abs=0.2) for x in pub)
+
+
+def _no_counter_max(est):
+    est._c_max = 1e6  # as if it had once read far more: its highest reading says nothing
+
+
+@pytest.mark.parametrize('what', ['the SoC as reported', 'the highest reading', 'the aged capacity'])
+def test_each_evidence_of_a_full_counter_alone_ends_the_segment(what):
+    """Each of the three, with the other two switched off, on the same input."""
+    if what == 'the SoC as reported':
+        est, _ = _int_soc_top(6.0, 0.97, after_restore=_no_counter_max)
+    elif what == 'the highest reading':
+        est, _ = _int_soc_top(6.0, 0.97, raw_soc=False, same_top=True)
+    else:
+        est, _ = _int_soc_top(6.0, 0.97, aged=True, raw_soc=False, after_restore=_no_counter_max)
+    assert est.counts['restart_unverified'] == 3 and not any(s['dq'] > 0 for s in est.segments)
+
+
+@pytest.mark.parametrize('same_top', [False, True])
+def test_calibration_without_the_reported_soc_and_the_counter_maximum_the_hidden_charge_is_published(same_top):
+    """The review's numbers, with what the old code had: the derived SoC and
+    the reported capacity. On both inputs of the tests above."""
+    for hidden, want in ((3.0, 95.0), (6.0, 91.7), (10.0, 87.3)):
+        est, pub = _int_soc_top(hidden, 0.97, raw_soc=False, after_restore=_no_counter_max, same_top=same_top)
+        chg = [s['qmax'] for s in est.segments if s['dq'] > 0]
+        assert est.counts['restart_unverified'] == 0 and chg, 'scenario is harmless'
+        assert all(x == pytest.approx(want, abs=0.3) for x in chg) and pub[-1] == pytest.approx(want, abs=0.3)
+
+
+def _learnt_full_end(hidden, out_ah=0.5, n=3):
+    """Rev8, finding 4: a counter that clamps at a learnt full end of 95 Ah
+    below the capacity it reports (100 Ah), with a decimal SoC against that
+    capacity (95.0 % at the top, so neither SoC sign fires) and no aged
+    capacity. Per cycle: 88 Ah out, a bottom rest, a charge until the counter
+    reaches 95 Ah; the host shuts down; while it is off the charger pushes
+    `hidden` Ah more (the counter held at 95) and out_ah go out (counted); it
+    boots 120 s later by its frozen clock, at rest at the top. Only the
+    highest reading of the counter before the shutdown says it was at a stop.
+    Returns (estimator, published Qmax values)."""
+    top, res = 95.0, 0.1
+    p = Pack(soc0=91.0)
+    cnt, rows_c = [top], {}
+
+    def go(i, secs, sample=True):
+        n0 = len(p.rows)
+        p.run(i, secs, sample=sample)
+        if sample:
+            for t, _, _, _ in p.rows[n0:]:
+                cnt[0] = min(top, max(0.0, cnt[0] - i * p.dt / 3600.0))
+                rows_c[t] = round(cnt[0] / res) * res
+        else:
+            cnt[0] = min(top, max(0.0, cnt[0] - i * secs / 3600.0))
+    go(0.0, 7200)
+    cuts, shifts = [], []
+    for _ in range(n):
+        go(50.0, 3600 * 88 / 50)
+        go(0.0, 7200)
+        go(-50.0, 3600 * (top - cnt[0]) / 50)
+        cuts.append(len(p.rows))
+        go(-50.0, 3600 * hidden / 50, sample=False)
+        go(20.0, 3600 * out_ah / 20, sample=False)
+        shifts.append(3600 * hidden / 50 + 3600 * out_ah / 20 + p.dt - 120.0)
+        go(0.0, 7200)
+    go(20.0, 300)
+    rows, shift, k = [], 0.0, 0
+    for j, (t, cur, v, temp) in enumerate(p.rows):
+        if k < len(cuts) and j == cuts[k]:
+            shift += shifts[k]
+            k += 1
+        rows.append((t - shift, cur, v, temp, rows_c[t]))
+    est, pub = _fresh(), []
+    for a, b in zip([0] + cuts, cuts + [len(rows)]):
+        for t, i, v, temp, c in rows[a:b]:
+            r = est.add(t, i, v, temp=temp, capacity=100.0, bms_charge=c, bms_soc=c, bms_soc_raw=c)
+            if r is not None:
+                pub.append(r['qmax'])
+        if b < len(rows):
+            st = _via_json(est.get_state(full=True))
+            est = _fresh()
+            assert est.restore(st)
+    return est, pub
+
+
+@pytest.mark.parametrize('hidden', [3.0, 6.0])
+def test_a_counter_at_its_learnt_full_end_at_the_shutdown_is_no_evidence(hidden):
+    """Deleting the highest reading before the shutdown (rev8, M11) passed
+    every test; on this input it lets the restarts continue and 96.2 Ah (3 Ah
+    hidden) and 93.2 / 96.0 / 102.7 Ah (6 Ah) out as charge segments."""
+    est, pub = _learnt_full_end(hidden)
+    assert est.counts['restart_unverified'] == 3 and not any(s['dq'] > 0 for s in est.segments)
+    assert pub and all(x == pytest.approx(98.0, abs=0.6) for x in pub)
+
+
+def test_calibration_without_the_highest_reading_before_the_shutdown_the_hidden_charge_is_published(monkeypatch):
+    orig = q.QmaxEstimator._counter_stop
+
+    def no_max_before(self, c, ends, c_max, when):
+        return orig(self, c, ends, 1e9 if when == 'before' else c_max, when)
+    monkeypatch.setattr(q.QmaxEstimator, '_counter_stop', no_max_before)
+    for hidden, want in ((3.0, [96.2] * 3), (6.0, [93.2, 96.0, 102.7])):
+        est, _ = _learnt_full_end(hidden)
+        chg = [s['qmax'] for s in est.segments if s['dq'] > 0]
+        assert est.counts['restart_unverified'] == 0 and chg, 'scenario is harmless'
+        assert chg == pytest.approx(want, abs=0.2), (hidden, chg)
+
+
+def test_a_counter_back_at_its_highest_reading_is_no_evidence():
+    """The cost of the counter-maximum rule, measured: a pack whose counter
+    returns to the same top every cycle (no stop, SoC 97 %) is refused at a
+    restart in the top rest, exactly as a counter held there would be. Once
+    the counter has been seen fuller, the same restart continues."""
+    p = full_cycles(n=2, dt=7.0)
+    cut = len(p.rows) // 2 + 3  # in the top rest after the first charge, the counter at 97.2 Ah
+    assert p.soc_bms[p.rows[cut][0]] < 99.0
+    est, _ = _split_run(p.rows, [cut], **bms(p))
+    assert est.counts['restart_unverified'] == 1
+    est, _ = _split_run(p.rows, [cut], **_seen_fuller(p))
+    assert est.counts['restart_unverified'] == 0
+
+
+def test_an_unknown_counter_maximum_is_no_evidence():
+    """A counter whose highest reading is unknown (an inconsistent state, or
+    no plausible reading) cannot be told from one at its full end."""
+    def resume(before):
+        est = _fresh()
+        for k in range(10):
+            est.add(T0 + 36 * k, 10.0, None, bms_charge=50.0 + 0.1 * (9 - k), bms_soc=50.0)
+        r = _fresh()
+        assert r.restore(_via_json(est.get_state()))
+        before(r)
+        r.add(T0 + 360, 10.0, None, bms_charge=49.9, bms_soc=50.0)
+        return r.counts['restart_unverified']
+    assert resume(lambda r: None) == 0
+    assert resume(lambda r: setattr(r, '_c_max', None)) == 1
+    assert resume(lambda r: setattr(r, '_c_max', 49.0)) == 1  # below the reading: not this counter's maximum
+
+
+@pytest.mark.parametrize('garbled', [120.1, 130.0, 500.0, 1199.0, 6553.5])
+def test_a_garbled_counter_reading_does_not_raise_the_counter_maximum(garbled):
+    """Only readings the pack can hold (<= 1.2 x the capacity) teach it: one
+    garbled 6553.5 Ah would hide the real full end for good. Rev8 (M6): a
+    limit 10x as loose passed every test; the readings between 1.2x and 12x
+    are what a looser limit lets in."""
+    est = _fresh()
+    for k, c in enumerate((90.0, 90.1, garbled, 90.2, 90.3)):
+        est.add(T0 + 10 * k, -36.0, None, bms_charge=c, bms_soc=90.0)
+    assert est._c_max == 90.3
+
+
+def test_monotone_in_how_far_the_counter_tops_out_below_the_reported_capacity():
+    """Refused at every ratio down to 0.5 (the SoC as reported is 100 % at
+    each), never accepted again."""
+    verdicts = [_int_soc_top(6.0, r)[0].counts['restart_unverified'] == 0 for r in (1.0, 0.97, 0.9, 0.7, 0.5)]
+    assert verdicts == [False] * 5
+
+
+def test_a_soc_above_100_is_kept_across_a_restart_and_taken_as_a_stop():
+    """A remaining charge above the capacity gives a derived SoC above 100.
+    That used to fail the saved state's validation, which then discarded
+    every segment at the next start."""
+    assert BmsSample(voltage=53.0, current=0.0, charge=100.5, capacity=100.0, soc=100).soc == 100.5
     est = _fresh()
     for k in range(10):
-        est.add(T0 + 36 * k, 10.0, None, bms_charge=c0 + 0.1 * (9 - k), bms_soc=soc0, capacity=cfull0)
+        est.add(T0 + 36 * k, 10.0, None, bms_charge=50.0 + 0.1 * (9 - k), bms_soc=100.5)
+    st = _via_json(est.get_state())
+    r = _fresh()
+    assert r.restore(st) and r._last_soc == 100.5
+    r.add(T0 + 360, 10.0, None, bms_charge=49.9, bms_soc=50.0)
+    assert r.counts['restart_unverified'] == 1
+
+
+def _resume_at(soc0=50.0, soc1=50.0, c1_off=0.0, cfull0=None, cfull1=None, c0=50.0, raw0=None, raw1=None,
+               aged0=None, aged1=None):
+    """A 10 A discharge, the counter in 0.1 Ah steps ending at c0 with the BMS
+    reading soc0 (raw0 as the driver reported it) and reporting cfull0 and
+    aged0; restart; the first sample 36 s later reads c0 - 0.1 + c1_off,
+    soc1, raw1, cfull1, aged1. Returns restart_unverified."""
+    est = _fresh()
+    for k in range(10):
+        est.add(T0 + 36 * k, 10.0, None, bms_charge=c0 + 0.1 * (9 - k), bms_soc=soc0, capacity=cfull0,
+                bms_soc_raw=raw0, aged_capacity=aged0)
     r = _fresh()
     assert r.restore(_via_json(est.get_state()))
-    r.add(T0 + 360, 10.0, None, bms_charge=c0 - 0.1 + c1_off, bms_soc=soc1, capacity=cfull1)
+    r.add(T0 + 360, 10.0, None, bms_charge=c0 - 0.1 + c1_off, bms_soc=soc1, capacity=cfull1, bms_soc_raw=raw1,
+          aged_capacity=aged1)
     return r.counts['restart_unverified']
 
 
@@ -1571,13 +2202,20 @@ STOPS = [
     ('the counter at empty', dict(c0=0.15)),
     ('the counter at the capacity the BMS reports', dict(cfull1=49.95)),
     ('the counter at it before', dict(cfull0=50.05)),
+    ('SoC 100 as reported after', dict(raw1=100)),
+    ('SoC 100 as reported before', dict(raw0=100)),
+    ('SoC 0 as reported after', dict(raw1=0)),
+    ('the counter at the aged capacity after', dict(aged1=49.95)),
+    ('the counter at the aged capacity before', dict(aged0=50.05)),
+    ('the counter at its highest reading after', dict(c1_off=1.0)),
+    ('a counter reading the pack cannot hold after', dict(c1_off=200.0)),
 ]
 
 
 @pytest.mark.parametrize('what,kw', STOPS, ids=[x[0] for x in STOPS])
 def test_a_counter_that_may_be_at_a_stop_is_no_evidence(what, kw):
     assert _resume_at() == 0  # the same restart with the counter mid-range continues
-    assert _resume_at(cfull0=100.0, cfull1=100.0) == 0
+    assert _resume_at(cfull0=100.0, cfull1=100.0, raw0=50, raw1=50, aged0=90.0, aged1=90.0) == 0
     assert _resume_at(**kw) == 1
 
 
@@ -1586,6 +2224,14 @@ def test_monotone_in_the_soc_at_a_restart():
     _monotone([_resume_at(soc1=x) == 0 for x in (50.0, 90.0, 98.0, 98.9, 99.0, 99.5, 100.0)])
     _monotone([_resume_at(soc1=x) == 0 for x in (50.0, 10.0, 2.0, 1.1, 1.0, 0.5, 0.0)])
     _monotone([_resume_at(soc0=x) == 0 for x in (50.0, 90.0, 98.0, 98.9, 99.0, 99.5, 100.0)])
+    _monotone([_resume_at(raw1=x) == 0 for x in (50, 90, 98, 99, 100, 101, 255)])  # to the far tail
+    _monotone([_resume_at(soc1=x) == 0 for x in (50.0, 99.5, 100.5, 150.0)])
+
+
+def test_monotone_in_how_close_the_counter_is_to_its_ends():
+    """Towards the aged capacity and towards the counter's highest reading."""
+    _monotone([_resume_at(aged1=x) == 0 for x in (90.0, 60.0, 50.0, 49.95, 49.9, 40.0, 1.0)])
+    _monotone([_resume_at(c1_off=x) == 0 for x in (0.0, 0.5, 0.9, 1.0, 5.0, 69.0, 200.0)])
 
 
 def _stuck_counter(stuck_s, hidden_ah=44.0, cache_s=0.0, n=1):
@@ -1621,15 +2267,130 @@ def test_a_counter_that_stopped_before_the_restart_is_no_evidence():
     assert pub and all(r['qmax'] == pytest.approx(98.0, rel=0.01) for r in pub)
 
 
-def test_calibration_without_the_staleness_term_a_stopped_counter_publishes_half_the_pack():
+def _no_audit(monkeypatch):
+    """Switch off the check after a continued restart (_audit_step): it is
+    the second layer behind the restart's own evidence, and catches the
+    stopped counters below once they move again."""
+    monkeypatch.setattr(q.QmaxEstimator, '_start_audit', lambda self, *a: None)
+
+
+def test_calibration_without_the_staleness_term_a_stopped_counter_publishes_half_the_pack(monkeypatch):
+    """Redundant, and said so: the counter catches up after the restart, and
+    the check after it ends the segment. Without both, 49 Ah."""
     rows, cuts, charge, soc = _stuck_counter(600.0, n=3)
 
     def fresh_looking(est):
-        est._c_q = est.q_ah  # as if the counter had just moved: the old check
+        est._c_q = est.q_moved  # as if the counter had just moved: the old check
+    est, _ = _split_run(rows, cuts, charge=charge, soc=soc, after_restore=fresh_looking)
+    assert est.counts['restart_audit'] == 3 and not any(s['dq'] < 0 for s in est.segments)
+    _no_audit(monkeypatch)
     est, pub = _split_run(rows, cuts, charge=charge, soc=soc, after_restore=fresh_looking)
     dis = [s['qmax'] for s in est.segments if s['dq'] < 0]
     assert est.counts['restart_unverified'] == 0 and dis, 'scenario is harmless'
     assert dis[0] < 0.55 * 98.0 and pub[0]['plausibility_checked']  # 49 Ah
+
+
+def _netzero_frozen(swing_s, n=3, after_restore=None, reps=1):
+    """Fourth review, finding 5c: _frozen_clock (22 A, 44 Ah while the host is
+    off, 2 minutes on its clock), with the BMS's counter stopped swing_s x 2
+    x reps before the shutdown, and the current swinging +22 A for swing_s
+    then -22 A for swing_s, reps times (net zero), the counter reading the
+    same up to the first sample after the restart."""
+    p = Pack().rest()
+    cuts, frozen, i = [], [], 22.0
+    for _ in range(n):
+        p.run(i, 3600)
+        f0 = len(p.rows)
+        for _ in range(reps):
+            p.run(i, swing_s).run(-i, swing_s)
+        cuts.append(len(p.rows))
+        frozen.append(f0)
+        p.run(i, 3600 * 44 / i, sample=False)
+        p.run(i, 3600 * (88 - 22 - 44) / i).rest()
+        p.run(-50.0, 3600 * 88 / 50).rest()
+    p.end()
+    rows, charge, soc, shift, k = [], {}, {}, 0.0, 0
+    for j, (t, cur, v, temp) in enumerate(p.rows):
+        if k < len(cuts) and j == cuts[k]:
+            shift += 3600 * 44 / i + p.dt - 120.0
+            k += 1
+        rows.append((t - shift, cur, v, temp))
+        charge[t - shift], soc[t - shift] = p.charge[t], p.soc_bms[t]
+    for f0, c in zip(frozen, cuts):
+        held = charge[rows[f0 - 1][0]]
+        for j in range(f0, c + 1):
+            charge[rows[j][0]] = held
+    return _split_run(rows, cuts, charge=charge, soc=soc, after_restore=after_restore)
+
+
+@pytest.mark.parametrize('swing_min', [10, 30, 60])
+def test_a_counter_stopped_through_a_net_zero_swing_is_no_evidence(swing_min):
+    """The staleness term used the net charge since the counter last moved:
+    +-22 A for 2 x swing_min nets to zero, so a counter stopped for 20-120
+    minutes read as fresh and 48.7-49.5 Ah went out for 98. The charge moved
+    either way is 7-44 Ah."""
+    est, pub = _netzero_frozen(60.0 * swing_min)
+    assert est.counts['restart_unverified'] == 3 and not any(s['dq'] < 0 for s in est.segments)
+    assert pub and all(r['qmax'] == pytest.approx(98.0, rel=0.01) for r in pub)
+
+
+def _netzero_frozen_net_term(swing_s):
+    """_netzero_frozen with the old term: the net charge since the counter
+    last moved (q_ah then, recorded here) in place of the charge moved."""
+    box, add = {}, q.QmaxEstimator.add
+
+    def recording(self, *a, **k):
+        c_q = self._c_q
+        r = add(self, *a, **k)
+        if self._c_q != c_q:
+            box['net'] = self.q_ah
+        return r
+
+    def net_term(est):
+        est._c_q = est.q_moved - abs(est.q_ah - box['net'])
+    try:
+        q.QmaxEstimator.add = recording
+        return _netzero_frozen(swing_s, after_restore=net_term)
+    finally:
+        q.QmaxEstimator.add = add
+
+
+def test_calibration_with_the_net_charge_a_stopped_counter_publishes_half_the_pack(monkeypatch):
+    est, _ = _netzero_frozen_net_term(600.0)
+    assert est.counts['restart_audit'] == 3 and not any(s['dq'] < 0 for s in est.segments)  # (second layer)
+    _no_audit(monkeypatch)
+    est, pub = _netzero_frozen_net_term(600.0)
+    dis = [s['qmax'] for s in est.segments if s['dq'] < 0]
+    assert est.counts['restart_unverified'] == 0 and dis, 'scenario is harmless'
+    assert all(x < 0.55 * 98.0 for x in dis) and pub[0]['plausibility_checked']  # 48.7 Ah
+
+
+def test_monotone_in_the_swing_a_stopped_counter_missed():
+    verdicts = [_netzero_frozen(60.0 * m, n=1)[0].counts['restart_unverified'] == 0 for m in (0, 1, 2, 3, 5, 10, 60)]
+    _monotone(verdicts)
+    assert verdicts[0] and not verdicts[-1]  # 0: the documented residual (stopped right at the shutdown)
+
+
+def test_a_counter_stopped_through_a_current_that_changes_sign_every_sample_is_no_evidence():
+    """Rev8, finding 5: the charge moved is the trapezoid of |I| per interval,
+    not |trapezoid of I|. They differ only where the current changes sign
+    between two samples (0.66 % of the charge moved in the 16 telemetry
+    packs, up to 75 % of one hour's on one): +-22 A alternating every sample
+    for 20 minutes moves 7.3 Ah and nets to zero in every interval."""
+    est, pub = _netzero_frozen(10.0, reps=60)
+    assert est.counts['restart_unverified'] == 3 and not any(s['dq'] < 0 for s in est.segments)
+    assert pub and all(r['qmax'] == pytest.approx(98.0, rel=0.01) for r in pub)
+
+
+def test_calibration_with_the_net_charge_per_interval_a_stopped_counter_publishes_half_the_pack(monkeypatch):
+    monkeypatch.setattr(q.QmaxEstimator, '_moved', staticmethod(lambda i0, i1, dt: abs(0.5 * (i0 + i1) * dt / 3600.0)))
+    est, _ = _netzero_frozen(10.0, reps=60)
+    assert est.counts['restart_audit'] == 3 and not any(s['dq'] < 0 for s in est.segments)  # (second layer)
+    _no_audit(monkeypatch)
+    est, pub = _netzero_frozen(10.0, reps=60)
+    dis = [s['qmax'] for s in est.segments if s['dq'] < 0]
+    assert est.counts['restart_unverified'] == 0 and dis, 'scenario is harmless'
+    assert all(x < 0.55 * 98.0 for x in dis) and pub[0]['plausibility_checked']
 
 
 def test_a_counter_read_from_a_30_s_cache_still_continues():
@@ -1645,8 +2406,10 @@ def test_monotone_in_how_long_the_counter_was_stale():
     """Nothing hidden, the counter repeated for stuck_s before the shutdown
     and live again after it: accepted while the lag is small, and never again
     once refused. With 44 Ah hidden and the counter stuck through the restart
-    it is refused once it had been stuck for ~250 s (1.5 Ah at 22 A) before
-    the shutdown; below that is the residual the module doc names."""
+    it is refused once the charge that moved since it last moved, with the
+    bridge's miss and the resolution, exceeds 2 % of the capacity: a bound in
+    charge, ~1.5 Ah moved, which at this 22 A takes ~250 s (at 44 A half
+    that). Below it is the residual the module doc names."""
     def ok(stuck_s, hidden):
         rows, cuts, charge, soc = _stuck_counter(stuck_s, hidden_ah=hidden)
         if not hidden:  # live again after the restart: the first sample reads the truth
@@ -1657,6 +2420,89 @@ def test_monotone_in_how_long_the_counter_was_stale():
     held = [ok(x, 44.0) for x in (60.0, 120.0, 180.0, 240.0, 300.0, 600.0, 3600.0)]
     _monotone(held)
     assert held == [True] * 4 + [False] * 3  # 60..240 s passed, 300 s and more refused
+
+
+@pytest.mark.parametrize('stuck_s', [60.0, 120.0, 240.0])
+def test_a_counter_stopped_just_before_the_shutdown_is_caught_once_it_moves_again(stuck_s):
+    """The residual the restart's own check cannot see (module doc): the
+    counter stopped less than 2 % of the capacity before the shutdown and
+    reads the same after it, while the pack delivered 44 Ah unseen. The
+    restart continues -- and the pairs across it are held until the counter
+    is seen moving with the current. It comes back with the 44 Ah it counted:
+    the segment ends there, and 49 Ah no longer go out for 98."""
+    rows, cuts, charge, soc = _stuck_counter(stuck_s, n=3)
+    est, pub = _split_run(rows, cuts, charge=charge, soc=soc)
+    assert est.counts['restart_unverified'] == 0 and est.counts['restart_audit'] == 3
+    assert not any(s['dq'] < 0 for s in est.segments)
+    assert pub and all(r['qmax'] == pytest.approx(98.0, rel=0.01) for r in pub)
+
+
+def test_calibration_without_the_check_after_the_restart_the_stopped_counter_publishes_half_the_pack(monkeypatch):
+    _no_audit(monkeypatch)
+    rows, cuts, charge, soc = _stuck_counter(120.0, n=3)
+    est, pub = _split_run(rows, cuts, charge=charge, soc=soc)
+    dis = [s['qmax'] for s in est.segments if s['dq'] < 0]
+    assert dis, 'scenario is harmless'
+    assert all(x < 0.55 * 98.0 for x in dis) and pub[0]['plausibility_checked']
+
+
+def test_a_counter_that_stays_stopped_after_the_restart_ends_the_segment():
+    """A counter stopped for good (a hung BMS) never moves again: once more
+    than the tolerance has moved without it, the restart's evidence is void."""
+    rows, cuts, charge, soc = _frozen_clock(hidden_ah=0.0, n=1)
+    held = charge[rows[cuts[0] - 1][0]]
+    charge = {t: (held if t >= rows[cuts[0] - 1][0] else c) for t, c in charge.items()}
+    est, _ = _split_run(rows, cuts, charge=charge, soc=soc)
+    assert est.counts['restart_unverified'] == 0 and est.counts['restart_audit'] == 1
+    assert not any(s['dq'] < 0 for s in est.segments)
+
+
+def test_a_counter_stopped_after_the_restart_through_a_swinging_current_ends_the_segment():
+    """+-22 A alternating nets to zero, so the counted and the BMS's charge
+    agree; 7.3 Ah moved while the counter stood still is what ends it."""
+    est = _fresh()
+    for k in range(10):
+        est.add(T0 + 36 * k, 10.0, None, bms_charge=50.0 + 0.1 * (9 - k), bms_soc=50.0)
+    r = _fresh()
+    assert r.restore(_via_json(est.get_state()))
+    r.add(T0 + 360, 0.0, None, bms_charge=49.9, bms_soc=50.0)
+    assert r._audit is not None
+    for k in range(120):
+        r.add(T0 + 370 + 10 * k, 22.0 if k % 2 else -22.0, None, bms_charge=49.9, bms_soc=50.0)
+    assert r.counts['restart_audit'] == 1 and r._audit is None
+
+
+def test_a_clean_restart_is_released_once_the_counter_moves():
+    """What the hold costs a clean restart: nothing but time. A restart in
+    the bottom rest, then a 3 A load: the rest's anchor is made before the
+    counter has moved two 0.1 Ah steps, so its pair across the restart waits,
+    and is accepted once the counter has, with the value of the run without
+    the restart. (After a rest under a real load the counter moves first.)"""
+    p = Pack().rest()
+    p.run(50.0, 3600 * 88 / 50).rest(7200)
+    cut = len(p.rows) - 300  # 50 min before the end of the bottom rest
+    p.run(3.0, 600).run(-50.0, 3600 * 88 / 50).rest().end()
+    whole, _ = run(p.rows, **bms(p))
+    est, pub = _split_run(p.rows, [cut], **bms(p))
+    assert est.counts['restart_audit'] == 0 and est.pair_reasons['restart_held'] == 1
+    assert seg_q(est) == pytest.approx(seg_q(whole), rel=1e-9) and len(est.segments) == 2
+
+
+def test_a_pending_check_survives_a_restart_and_a_second_restart_before_it_ends_the_segment():
+    """Saved and restored with the state; a second restart while the first is
+    unconfirmed has nothing to stand on (the counter has not been seen moving
+    since): it ends the segment like one without evidence."""
+    est = _fresh()
+    for k in range(10):
+        est.add(T0 + 36 * k, 10.0, None, bms_charge=50.0 + 0.1 * (9 - k), bms_soc=50.0)
+    r = _fresh()
+    assert r.restore(_via_json(est.get_state()))
+    r.add(T0 + 360, 0.0, None, bms_charge=49.9, bms_soc=50.0)
+    assert r._audit is not None and r.counts['restart_unverified'] == 0
+    r2 = _fresh()
+    assert r2.restore(_via_json(r.get_state())) and r2._audit == r._audit
+    r2.add(T0 + 400, 0.0, None, bms_charge=49.9, bms_soc=50.0)
+    assert r2.counts['restart_unverified'] == 1 and r2._audit is None
 
 
 def test_the_counter_resolution_is_learnt_per_counter():
@@ -1733,6 +2579,115 @@ def test_a_restart_across_a_change_of_counter_ends_the_segment():
     src = {t: ('soc*100.0' if t >= rows[cut][0] else 'charge') for t in p.charge}
     est, _ = _split_run(rows, [cut], src=src, **bms(p))
     assert est.counts['restart_unverified'] == 1 and not any(s['dq'] < 0 for s in est.segments)
+
+
+def _replaced(newcap, new_caps, forge_capacity=False, n_new=1):
+    """Fourth review, finding 2: the 100 Ah pack's state (5 segments, 97.5 Ah)
+    restored under the option newcap, then n_new cycles of the new pack
+    (cells new_caps). forge_capacity: the saved state claims newcap, as a
+    state without the check would pass it. Returns (estimator, published)."""
+    p = full_cycles(n=3)
+    est, pub = run(p.rows, cap=100.0)
+    assert pub[-1]['qmax'] == pytest.approx(97.5, abs=0.2) and len(est.segments) == 5
+    st = _via_json(est.get_state(full=True))
+    if forge_capacity:
+        st['capacity'] = newcap
+        for x in st['anchors'] + st['segments']:
+            x['cap'] = newcap
+    e2 = _fresh(newcap)
+    assert e2.restore(st)
+    p2 = Pack(caps=new_caps, t0=p.t + 86400).rest()
+    for _ in range(n_new):
+        p2.cycle(dq=0.88 * min(new_caps), i=0.5 * newcap)
+    return run(p2.end().rows, est=e2)
+
+
+def test_a_changed_capacity_option_discards_the_saved_segments(caplog):
+    """The review's case: a 100 Ah pack replaced by a 274 Ah one and the
+    option set to 280. The old median, 97.5, went out as SoH 34.8 % with the
+    plausibility check passed, though 97.5 is outside 112-336 Ah. Now the
+    old state is dropped (logged) and the new pack's value comes out once it
+    has its own segments."""
+    caps = tuple(c * 2.8 for c in CAPS)
+    with caplog.at_level('WARNING'):
+        est, pub = _replaced(280.0, caps)
+    assert pub == []  # 2 segments of the new pack: not enough yet
+    assert 'measured against 100 Ah' in caplog.text
+    est, pub = _replaced(280.0, caps, n_new=2)
+    assert pub and all(r['qmax'] == pytest.approx(273.0, rel=0.01) for r in pub)
+    assert all(r['soh'] == pytest.approx(97.5, abs=0.5) for r in pub)
+
+
+def test_the_same_capacity_option_keeps_the_saved_segments():
+    est, pub = _replaced(100.0, CAPS)
+    assert pub and pub[-1]['qmax'] == pytest.approx(97.5, abs=0.2) and pub[-1]['segments'] == 5
+
+
+def test_a_segment_outside_the_present_window_is_not_published():
+    """The check at publication, on its own: a state that claims the new
+    option (as one without the restore check would) still holds segments of
+    97.5 Ah, outside 0.4-1.2 x 280. They are left out of the median."""
+    est, pub = _replaced(280.0, tuple(c * 2.8 for c in CAPS), forge_capacity=True)
+    assert len(est.segments) == 5 and pub == []
+    assert all(r['qmax'] > 0.4 * 280 for r in _replaced(280.0, tuple(c * 2.8 for c in CAPS), forge_capacity=True,
+                                                        n_new=2)[1])
+
+
+def test_calibration_without_either_check_the_old_pack_is_published_as_the_new_ones_soh(monkeypatch):
+    monkeypatch.setattr(q.QmaxEstimator, '_counts', staticmethod(lambda s, cap, n: True))
+    est, pub = _replaced(280.0, tuple(c * 2.8 for c in CAPS), forge_capacity=True)
+    assert pub, 'scenario is harmless'
+    assert pub[-1]['qmax'] == pytest.approx(97.5, abs=0.2) and pub[-1]['soh'] == pytest.approx(34.8, abs=0.2)
+    assert pub[-1]['plausibility_checked']
+
+
+def test_a_saved_segment_of_another_capacity_is_dropped_and_never_counted(caplog):
+    """Inside a state that claims the present option, a segment (or anchor)
+    checked against another capacity is dropped on restore, logged; and one
+    that got in anyway is not counted at publication, though its value is
+    inside the present window."""
+    est, pub = run(full_cycles(n=3).rows, cap=100.0)
+    st = _via_json(est.get_state(full=True))
+    st['segments'][0]['cap'] = 120.0
+    st['anchors'][-1]['cap'] = 120.0
+    r = _fresh(100.0)
+    with caplog.at_level('WARNING'):
+        assert r.restore(st)
+    assert len(r.segments) == 4 and len(r.anchors) == len(st['anchors']) - 1
+    assert '2 saved anchor(s)/segment(s) checked against another capacity' in caplog.text
+    r.segments.append(dict(r.segments[-1], cap=120.0))
+    assert len(r._counted()) == 4 and r.result()['segments'] == 4
+
+
+def test_segments_of_another_cell_count_are_not_published():
+    """Another pack identity sign: the 4-cell pack (worn, Qmax 68.6) replaced
+    by an 8-cell one of the same nameplate. Only segments with the newest
+    one's cell count go into the median."""
+    worn = tuple(0.7 * c for c in CAPS)
+    p = full_cycles(n=3, caps=worn, dq=0.88 * min(worn))
+    est, pub = run(p.rows, cap=100.0)
+    assert pub[-1]['qmax'] == pytest.approx(0.7 * 97.5, abs=0.3)
+    e2 = _fresh(100.0)
+    assert e2.restore(_via_json(est.get_state(full=True)))
+    p2 = Pack(caps=CAPS + CAPS, t0=p.t + 86400).rest().cycle().end()
+    _, pub2 = run(p2.rows, est=e2)
+    assert pub2 == []  # 2 segments of 8 cells
+    p3 = Pack(caps=CAPS + CAPS, t0=p2.t + 86400).rest().cycle().end()
+    _, pub3 = run(p3.rows, est=e2)
+    assert pub3 and all(r['qmax'] == pytest.approx(97.5, abs=0.3) for r in pub3)
+
+
+def test_calibration_without_the_cell_count_check_the_old_pack_outvotes_the_new_one(monkeypatch):
+    orig = q.QmaxEstimator._counts
+    monkeypatch.setattr(q.QmaxEstimator, '_counts', staticmethod(lambda s, cap, n: orig(s, cap, len(s['q_cells']))))
+    worn = tuple(0.7 * c for c in CAPS)
+    p = full_cycles(n=3, caps=worn, dq=0.88 * min(worn))
+    est, _ = run(p.rows, cap=100.0)
+    e2 = _fresh(100.0)
+    assert e2.restore(_via_json(est.get_state(full=True)))
+    _, pub2 = run(Pack(caps=CAPS + CAPS, t0=p.t + 86400).rest().cycle().end().rows, est=e2)
+    assert pub2, 'scenario is harmless'
+    assert pub2[-1]['qmax'] == pytest.approx(0.7 * 97.5, abs=0.3)  # the old pack's value for the new one
 
 
 def test_restoring_publishes_nothing_by_itself():
@@ -1963,17 +2918,32 @@ BAD_STATES = [
     ('q_charge zero', lambda s: s.update(q_charge=0.0)),
     ('q_charge negative', lambda s: s.update(q_charge=-0.1)),
     ('q_charge NaN', lambda s: s.update(q_charge=float('nan'))),
-    ('q_charge of no counter', lambda s: s.update(charge_src=None)),
+    ('q_charge of no counter', lambda s: s.update(charge_src=None, charge_max=None)),  # (only that rule)
     ('charge_src unknown', lambda s: s.update(charge_src='voltage')),
     ('charge_src bad capacity', lambda s: s.update(charge_src='soc*-5.0')),
-    ('last_soc out of range', lambda s: s.update(last_soc=140.0)),
+    ('last_soc not a number', lambda s: s.update(last_soc='full')),
+    ('last_soc_raw not a number', lambda s: s.update(last_soc_raw=[100])),
+    ('last_aged not positive', lambda s: s.update(last_aged=0.0)),
+    ('charge_max negative', lambda s: s.update(charge_max=-1.0)),
+    ('charge_max of no counter', lambda s: s.update(charge_src=None, q_charge=None, charge_q=None,
+                                                     last_charge=None)),
     ('last_charge_full not positive', lambda s: s.update(last_charge_full=-1.0)),
     ('charge_q without q_charge', lambda s: s.update(q_charge=None)),
-    ('glitch_open without a glitch', lambda s: s.update(glitch_open=True, t_glitch=None)),
-    ('glitch_open not a bool', lambda s: s.update(glitch_open='yes')),
+    ('glitch_nb without a glitch', lambda s: s.update(glitch_nb=dict(before=[1.0], after=[]), t_glitch=None)),
+    ('glitch_nb garbage', lambda s: s.update(glitch_nb='yes', t_glitch=1.0)),
+    ('glitch_nb already decided', lambda s: s.update(glitch_nb=dict(before=[1.0] * 5, after=[1.0] * 5), t_glitch=1.0)),
+    ('glitch_nb not numbers', lambda s: s.update(glitch_nb=dict(before=['a'], after=[]), t_glitch=1.0)),
+    ('recent too long', lambda s: s.update(recent=[1.0] * 6)),
+    ('bms_caps garbage', lambda s: s.update(bms_caps=[[1.0]])),
+    ('bms_caps not positive', lambda s: s.update(bms_caps=[[s['last_t'], 0.0]])),
+    ('bms_caps after last_t', lambda s: s.update(bms_caps=[[s['last_t'] + 1, 100.0]])),
+    ('recent missing', lambda s: s.pop('recent')),
     ('not a dict', lambda s: ['a list']),
     ('other version', lambda s: s.update(version=99)),
     ('q_ah NaN', lambda s: s.update(q_ah=float('nan'))),
+    ('q_moved missing', lambda s: s.pop('q_moved')),
+    ('q_moved negative', lambda s: s.update(q_moved=-1.0)),
+    ('charge_q beyond q_moved', lambda s: s.update(charge_q=s['q_moved'] + 1.0)),
     ('last_i without last_t', lambda s: s.update(last_t=None)),
     ('epoch negative', lambda s: s.update(epoch=-1)),
     ('anchor soc out of range', lambda s: s['anchors'][1]['soc'].__setitem__(0, 140.0)),
@@ -1989,6 +2959,15 @@ BAD_STATES = [
     ('bin not at last_t', lambda s: s['bin'].update(t1=s['bin']['t1'] - 5)),
     ('rest bins without rest_t0', lambda s: s.update(rest_t0=None)),
     ('rest bin garbage', lambda s: s['rest_bins'].append('x')),
+    ('audit garbage', lambda s: s.update(audit='yes')),
+    ('audit after last_t', lambda s: s.update(audit=dict(t=s['last_t'] + 1, c=50.0, src='charge', q=0.0, m=0.0,
+                                                          held=[]))),
+    ('audit moved beyond q_moved', lambda s: s.update(audit=dict(t=s['last_t'], c=50.0, src='charge', q=0.0,
+                                                                  m=s['q_moved'] + 1, held=[]))),
+    ('audit of an unknown counter', lambda s: s.update(audit=dict(t=s['last_t'], c=50.0, src='volts', q=0.0, m=0.0,
+                                                                   held=[]))),
+    ('audit held not numbers', lambda s: s.update(audit=dict(t=s['last_t'], c=50.0, src='charge', q=0.0, m=0.0,
+                                                              held=['x']))),
 ]
 
 
@@ -2026,13 +3005,17 @@ def test_calibration_without_the_qmax_check_a_forged_segment_would_be_restored()
 def test_a_chemistry_disable_survives_a_restart_an_internal_error_does_not():
     est, _ = run(_nmc_day().rows)
     assert not est.enabled
-    r = q.QmaxEstimator('t', curve=SYNTH)
+    r = q.QmaxEstimator('t', design_capacity=100.0, curve=SYNTH)
     r.restore(_via_json(est.get_state(full=False)))
     assert not r.enabled and 'LiFePO4' in r.disabled_reason
+    # under another capacity option it may be another pack: re-checked from scratch
+    r = q.QmaxEstimator('t', design_capacity=280.0, curve=SYNTH)
+    r.restore(_via_json(est.get_state(full=False)))
+    assert r.enabled
 
     est2, _ = run(full_cycles(n=1).rows)
     est2.disable('internal error', persistent=False)
-    r2 = q.QmaxEstimator('t', curve=SYNTH)
+    r2 = q.QmaxEstimator('t', design_capacity=100.0, curve=SYNTH)
     r2.restore(_via_json(est2.get_state(full=False)))
     assert r2.enabled
 
@@ -2129,6 +3112,88 @@ def _run_real(rows=None):
     return run(rows or real_rows(), est)
 
 
+REAL_COLD = os.path.join(os.path.dirname(__file__), 'data', 'daly_2025-11-21_cold_top.csv.gz')
+T_FULL_COLD = 1763728020.0  # 2025-11-21 12:27 UTC: the highest cell reaches 3550 mV
+
+
+def cold_rows(scale=1.0, bulk=None, remodel=0.0, warm=0.0):
+    """The van pack's cold morning (Daly, 280 Ah, two cells; 2025-11-21 05:00
+    -14:00 UTC, see data/SOURCES.md): 10-12 degC by its probe, and from 10:00
+    both cells at 3398-3412 mV under 13.7-15.8 A (C/20) while 33-45 Ah, 12-16 %,
+    were still to go. Perturbed as rev9 did: the charge current x scale (a
+    weaker sun), bulk = (A, minutes[, start]) from 08:20 or start (a DC-DC
+    charge while driving), the cell voltages moved by remodel [mOhm] x the change of the
+    current, warm degC added to the temperature (synthetic: the voltages stay
+    those of a cold pack)."""
+    def f(x):
+        return float(x) if x else math.nan
+    out = []
+    with gzip.open(REAL_COLD, 'rt') as fh:
+        for r in csv.DictReader(fh):
+            t, i = float(r['t']), f(r['current'])
+            new = i * scale if i < 0 else i  # (native sign: charging is negative)
+            t_bulk = bulk[2] if bulk and len(bulk) > 2 else 1763713200.0  # 08:20
+            if bulk and t_bulk <= t < t_bulk + 60 * bulk[1]:
+                new = -bulk[0]
+            dv = remodel * (i - new)  # mV per cell for a charge current changed by -(new - i)
+            out.append((t, new, [f(r['u1']) + dv, f(r['u2']) + dv], f(r['temp']) + warm))
+    return out
+
+
+def cold_tops(rows):
+    """[% of 280 Ah still to go after each top anchor, to 12:27]"""
+    est, _ = run(rows, q.QmaxEstimator('cold', design_capacity=280.0), curve=q.DEFAULT_CURVE)
+    out = []
+    for a in tops(est):
+        togo = sum(-i * 60 for t, i, v, temp in rows if a['t'] <= t < T_FULL_COLD and i < 0) / 3600
+        out.append(round(100 * togo / 280, 1))
+    return out
+
+
+def test_the_cold_morning_of_the_van_pack_is_no_charge_end(top_anchors):
+    """Rev9, finding 1. As recorded only the bulk rule's 2 A held it off;
+    with a DC-DC bulk (30 A for 20 min) and a 10 % weaker sun the old rules
+    took a tail anchor at 10:29 with 12 % still to go -- also with the cell
+    voltages moved by the cells' 0.5 mOhm for the changed current. Below 15
+    degC there is no top anchor (TOP_TEMP_LO). The cut-off at 13:35, at 15
+    degC, is a real full."""
+    assert cold_tops(cold_rows()) == [0.0]
+    for kw in (dict(scale=0.9, bulk=(30.0, 20)), dict(scale=0.9, bulk=(30.0, 20), remodel=0.5),
+               dict(scale=0.8, bulk=(30.0, 20), remodel=0.5)):
+        assert all(x <= 0.5 for x in cold_tops(cold_rows(**kw))), kw
+
+
+def test_calibration_above_10_degc_the_cold_morning_is_a_full_12_percent_short(top_anchors, monkeypatch):
+    monkeypatch.setattr(q, 'TOP_TEMP_LO', 10.0)
+    short = cold_tops(cold_rows(scale=0.9, bulk=(30.0, 20), remodel=0.5))
+    assert short and short[0] > 10.0  # a 12 % low SoH for a healthy pack, every such day
+
+
+def test_one_strong_minute_is_no_bulk(top_anchors):
+    """The cold morning, warmed (synthetic) so the temperature rule passes it:
+    one 40 A minute at 08:30 before a steady C/20 is no bulk phase
+    (TOP_BULK_SUSTAIN_S)."""
+    assert all(x <= 0.5 for x in cold_tops(cold_rows(scale=0.9, bulk=(40.0, 1, 1763713800.0), warm=5.0)))
+
+
+def test_calibration_with_a_one_minute_bulk_the_warmed_cold_morning_is_a_full(top_anchors, monkeypatch):
+    monkeypatch.setattr(q, 'TOP_BULK_SUSTAIN_S', 0.0)
+    short = cold_tops(cold_rows(scale=0.9, bulk=(40.0, 1, 1763713800.0), warm=5.0))
+    assert short and short[0] > 10.0
+
+
+def test_a_tail_that_did_not_fall_to_half_the_bulk_is_no_charge_end(top_anchors):
+    """The same, after 20 min of a 22 A bulk: the C/20 that follows is a
+    weaker source, not a CV taper (TOP_TAPER)."""
+    assert all(x <= 0.5 for x in cold_tops(cold_rows(scale=0.9, bulk=(22.0, 20), warm=5.0)))
+
+
+def test_calibration_without_the_taper_rule_the_warmed_cold_morning_is_a_full(top_anchors, monkeypatch):
+    monkeypatch.setattr(q, 'TOP_TAPER', math.inf)
+    short = cold_tops(cold_rows(scale=0.9, bulk=(22.0, 20), warm=5.0))
+    assert short and short[0] > 10.0
+
+
 def test_real_daly_three_nights_give_anchors_but_no_segment():
     """Four rests of 2-7 h: three on the plateau, the last near empty and
     evaluable for both cells. No segment: an outage of 7 min, and without it,
@@ -2162,6 +3227,543 @@ def test_real_daly_with_the_current_sign_flipped_has_only_sign_rejections(monkey
     monkeypatch.setattr(q, 'DRIFT_MAX_FRAC', math.inf)
     est, _ = _run_real([(t, -i, v, temp) for t, i, v, temp in real_rows()])
     assert not est.segments and est.pair_reasons['sign'] >= 1
+
+
+# ================================================================ top anchor: charge termination
+
+def lfp_ocv(soc):
+    """LFP-like OCV for the top-anchor tests: the built-in relaxed curve up to
+    98 % (flat at the top, steep only near empty, as measured), then the top
+    knee a cell climbs while it is charged: 99 % 3360, 99.5 % 3400, 100 %
+    3460 mV, steep beyond."""
+    base = q._interp(100.0 - max(0.0, min(soc, 98.0)), q.DEFAULT_CURVE.smooth)
+    if soc <= 98.0:
+        return base
+    pts = [(98.0, base), (99.0, 3360.0), (99.5, 3400.0), (100.0, 3460.0), (101.0, 3860.0)]
+    for (s0, v0), (s1, v1) in zip(pts, pts[1:]):
+        if soc <= s1:
+            return v0 + (v1 - v0) * (soc - s0) / (s1 - s0)
+    return 3860.0 + 400.0 * (soc - 101.0)
+
+
+class LfpPack(Pack):
+    """Pack on lfp_ocv (the built-in curve gives the bottom anchors), with a
+    charger: charge_cv() holds the highest cell at v_abs (CC at i_bulk, then
+    CV until the current falls to i_end), charge_cc() charges at a constant
+    current until the highest cell reads v_stop (then the BMS cuts)."""
+
+    def __init__(self, soc0=99.8, socs=None, **kw):
+        super().__init__(soc0=soc0, curve=q.DEFAULT_CURVE, ocv_fn=lfp_ocv, **kw)
+        if socs is not None:
+            self.soc = [float(s) for s in socs]
+
+    def _vmax(self, i):
+        return max(self.ocv(s) + self.hyst / 2 + self.r0 * i - e1 - e2 for s, e1, e2 in zip(self.soc, self.e1, self.e2))
+
+    def charge_cv(self, i_bulk=50.0, v_abs=3450.0, i_end=1.0, max_s=6 * 3600):
+        for _ in range(int(max_s / self.dt)):
+            i = min(i_bulk, max(0.0, (v_abs - self._vmax(0.0)) / self.r0))
+            if i < i_end:
+                break
+            self.run(-i, self.dt)
+        return self
+
+    def charge_cc(self, i, v_stop):
+        while self._vmax(i) < v_stop:
+            self.run(-i, self.dt)
+        return self
+
+
+def lfp_cycles(n=3, dq=92.0, cut=False, i_cut=20.0, **kw):
+    """Rest at the top; n x (discharge dq at 50 A, 2 h rest near empty (an
+    OCV anchor on the built-in curve), charge back (CV to 1 A, or CC at i_cut
+    until a BMS cut at 3620 mV), 30 min rest)."""
+    p = LfpPack(**kw).rest()
+    for _ in range(n):
+        p.run(50.0, 3600 * dq / 50).rest()
+        (p.charge_cc(i_cut, 3620.0) if cut else p.charge_cv()).rest(1800)
+    return p.end()
+
+
+def run_lfp(rows, **kw):
+    return run(rows, curve=q.DEFAULT_CURVE, **kw)
+
+
+def tops(est):
+    return [a for a in est.anchors if a['kind'] == 'top']
+
+
+def test_without_a_top_anchor_the_built_in_curve_publishes_nothing():
+    """Why the top anchor exists: the same cycles, OCV anchors only."""
+    est, pub = run_lfp(lfp_cycles().rows)
+    assert pub == [] and not est.segments and est.pair_reasons['dsoc'] >= 3
+
+
+@pytest.mark.parametrize('cut', [False, True], ids=['tail', 'cut-off'])
+def test_a_charge_termination_pairs_with_the_rests_near_empty_both_ways(top_anchors, cut):
+    """CV to the tail, or a BMS cut at the highest cell's 3620 mV at C/5: every
+    charge end is a top anchor, and each pairs with the OCV anchor near empty
+    before and after it. The limiting cell holds 98 Ah; the charger's full is
+    ~99.6 % of the cells' 100 %, so Qmax reads 0.2-0.8 % low."""
+    est, pub = run_lfp(lfp_cycles(cut=cut).rows)
+    assert est.counts['anchor_top'] == 3 and {a['mode'] for a in tops(est)} == {'cutoff' if cut else 'tail'}
+    assert [s['kinds'] for s in est.segments] == [['ocv', 'top'], ['top', 'ocv']] * 2 + [['ocv', 'top']]
+    assert all(s['qmax'] == pytest.approx(98.0, rel=0.01) for s in est.segments) and len(pub) == 3
+    assert all(s['qmax'] < 98.0 * 1.001 for s in est.segments)  # the bias is low (at most noise high)
+    assert pub[-1]['anchors'] == 'ocv->top' and pub[-1]['top_anchored'] == 5 and pub[-1]['limiting_cell'] == 2
+
+
+def test_two_charge_terminations_never_pair(top_anchors):
+    """A top-up after a shallow discharge: two fulls, and no SoC between them."""
+    p = LfpPack().rest()
+    p.charge_cv().rest(1800)
+    for _ in range(3):
+        p.run(50.0, 3600 * 30 / 50).charge_cv().rest(1800)
+    est, _ = run_lfp(p.end().rows)
+    assert est.counts['anchor_top'] >= 3 and est.pair_reasons['top_top'] >= 2 and not est.segments
+
+
+def test_top_anchors_are_saved_and_restored(top_anchors):
+    p = lfp_cycles()
+    whole, pub_whole = run_lfp(p.rows, **bms(p))
+    t_top = [a['t'] for a in tops(whole)]
+    # 30 min into the rest near empty after each of the first two: the top
+    # anchor is in the saved state, and pairs after the restart (at the top
+    # itself a restart ends the segment: the BMS's SoC reads 99 %, its stop rule)
+    cuts = [next(k for k, r in enumerate(p.rows) if r[0] > t + 1800 + 3600 * 92 / 50 + 1800) for t in t_top[:2]]
+    split, pub_split = _split_run(p.rows, cuts, curve=q.DEFAULT_CURVE, **bms(p))
+    assert [s['qmax'] for s in split.segments] == pytest.approx([s['qmax'] for s in whole.segments], rel=1e-9)
+    assert len(pub_split) == len(pub_whole) and split.counts['restart_unverified'] == 0
+
+
+# ---- what must not be a top anchor
+
+def _cloud_dip(r2=2.5, stale=False):
+    """A pack whose polarisation relaxes slowly (r2 = 2.5 mOhm, 20 min): a
+    50 A charge reads 3514 mV at 73 % SoC, then a cloud: 2 A for 15 minutes,
+    during which every cell still reads > 3400 mV and falls slowly. Then the
+    sun is back and the charge ends in CV; discharge, rest near empty.
+    stale: no cell voltages arrive during the dip (failed fetches)."""
+    p = LfpPack(r2=r2).rest()
+    p.run(50.0, 3600 * 92 / 50).rest()
+    p.charge_cc(50.0, 3514.0)
+    t_dip = p.t
+    p.run(-2.0, 900)
+    t_sun = p.t
+    p.charge_cv().rest(1800)
+    p.run(50.0, 3600 * 92 / 50).rest().end()
+    rows = [(t, i, None if stale and t_dip < t <= t_sun else v, temp) for t, i, v, temp in p.rows]
+    return rows, t_dip, t_sun
+
+
+@pytest.mark.parametrize('stale', [False, True], ids=['voltages', 'no voltages in the dip'])
+def test_a_pv_cloud_dip_is_no_charge_end(top_anchors, stale):
+    """The current falls below the tail, and the voltage falls with it: not
+    held (TOP_CV_BAND_MV). With no voltages in the dip there is nothing to
+    judge it by (TOP_VOLT_GAP_S): the reading from the peak does not stand in."""
+    rows, t_dip, t_sun = _cloud_dip(stale=stale)
+    est, _ = run_lfp(rows)
+    assert [a['t'] > t_sun for a in tops(est)] == [True]
+    assert all(s['qmax'] == pytest.approx(98.0, rel=0.015) for s in est.segments)
+
+
+def test_calibration_without_the_band_or_the_staleness_rules_the_cloud_dip_is_a_full(top_anchors, monkeypatch):
+    """The staleness rule has a second layer, and the test says so: a hold
+    also needs TOP_HOLD_READINGS readings. Without both, the reading from the
+    peak stands in for the whole dip."""
+    rows, t_dip, t_sun = _cloud_dip(stale=True)
+    monkeypatch.setattr(q, 'TOP_VOLT_GAP_S', math.inf)
+    assert [a['t'] > t_sun for a in tops(run_lfp(rows)[0])] == [True]
+    monkeypatch.undo()
+    for patch, stale in ((('TOP_CV_BAND_MV',), False), (('TOP_VOLT_GAP_S', 'TOP_HOLD_READINGS'), True)):
+        with monkeypatch.context() as m:
+            for name in patch:
+                m.setattr(q, name, math.inf if name != 'TOP_HOLD_READINGS' else 0)
+            rows, t_dip, t_sun = _cloud_dip(stale=stale)
+            est, _ = run_lfp(rows)
+            dip = [s for s in est.segments if t_dip < s['t'] <= t_sun]
+            assert dip, (patch, 'scenario is harmless')
+            assert dip[0]['qmax'] < 0.75 * 98.0  # the dip at 73 % SoC taken as 100 %: 69 Ah, inside 0.4-1.2x
+
+
+def _rising(stop_s=720.0):
+    """Resting at 95.3 %, an 11 minute bulk at 20 A, then 4 A (below the tail)
+    while the highest cell climbs the knee, ~8 mV a minute, for stop_s; then
+    the charger stops and the pack rests."""
+    p = LfpPack(soc0=95.3).rest()
+    p.run(-20.0, 660)
+    t_tail = p.t
+    p.run(-4.0, stop_s)
+    t_stop = p.t
+    p.rest(1800).run(50.0, 3600 * 92 / 50).rest().end()
+    return p.rows, t_tail, t_stop
+
+
+def test_the_first_crossing_of_the_tail_while_the_cell_still_climbs_is_no_charge_end(top_anchors):
+    """TOP_RISE_MV: the top anchor comes after the climb, at the charge's end,
+    not 3 minutes after the current first fell below the tail."""
+    rows, t_tail, t_stop = _rising()
+    est, _ = run_lfp(rows)
+    assert [a['t'] >= t_stop for a in tops(est)] == [True]
+
+
+def test_calibration_without_the_rise_rule_the_anchor_comes_while_the_cell_climbs(top_anchors, monkeypatch):
+    """Here the climb is the last 0.5 % (the model's knee), so the cost is
+    small; in real data it was a BMS cut at 3.65 V that followed (aTTx)."""
+    monkeypatch.setattr(q, 'TOP_RISE_MV', math.inf)
+    rows, t_tail, t_stop = _rising()
+    est, _ = run_lfp(rows)
+    assert tops(est) and t_tail < tops(est)[0]['t'] < t_stop
+
+
+def _low_cut(peak=None):
+    """A 20 A charge from near empty is cut at 70 Ah (78 % SoC, the highest
+    cell at ~3.37 V under the current: a BMS's temperature or current
+    protection), then a rest and a discharge. peak: instead, cut once the
+    highest cell reads `peak` mV (a polarised pack, r2 3 mOhm)."""
+    p = LfpPack(r2=3.0 if peak else 1.0).rest()
+    p.run(50.0, 3600 * 92 / 50).rest()
+    if peak:
+        p.charge_cc(20.0, peak)
+    else:
+        p.run(-20.0, 3600 * 70 / 20)
+    p.rest(3600).run(50.0, 3600 * 60 / 50).rest().end()
+    return p
+
+
+def test_a_cut_off_short_of_a_full_voltage_is_no_charge_end(top_anchors):
+    est, _ = run_lfp(_low_cut().rows)
+    assert not tops(est) and est.counts['top_cut_low'] == 1
+
+
+def test_calibration_a_cut_off_needs_both_its_peak_and_the_cells_after_it(top_anchors, monkeypatch):
+    """Redundant, and said so: without the peak rule, the cells a minute
+    after the cut (on the plateau) refuse it. Without both, 78 % is full."""
+    monkeypatch.setattr(q, 'TOP_CUTOFF_MV', 0.0)
+    est, _ = run_lfp(_low_cut().rows)
+    assert not tops(est) and est.counts['top_cut_not_full'] == 1
+    monkeypatch.setattr(q, 'TOP_CELL_MIN_MV', 0.0)
+    est, _ = run_lfp(_low_cut().rows)
+    assert tops(est) and est.segments and est.segments[-1]['qmax'] < 0.8 * 98.0
+
+
+def _trickle():
+    """Resting at 98.5 %, a charger that never gives more than 4 A (below the
+    tail) holds 3450 mV: no bulk phase, no tail-off."""
+    p = LfpPack(soc0=98.5).rest()
+    p.charge_cv(i_bulk=4.0).rest(1800)
+    return p.run(50.0, 3600 * 90 / 50).rest().end()
+
+
+def test_a_charge_without_a_bulk_phase_is_no_charge_end(top_anchors):
+    est, _ = run_lfp(_trickle().rows)
+    assert not tops(est)
+
+
+def test_calibration_without_the_bulk_rule_a_trickle_makes_top_anchors(top_anchors, monkeypatch):
+    """No measurable harm on this model (the trickle ends near full): the rule
+    is what makes a tail a current that fell, as Victron's is."""
+    monkeypatch.setattr(q, 'TOP_BULK_C', 0.0)
+    monkeypatch.setattr(q, 'TOP_TAPER', math.inf)  # (the taper is measured against the bulk)
+    est, _ = run_lfp(_trickle().rows)
+    assert tops(est)
+
+
+def _imbalanced(offset, cut=False, n=3):
+    """Equal 100 Ah cells, the third `offset` % SoC below the others (self
+    discharge): it is empty first, and short of full when the others are."""
+    return lfp_cycles(n=n, dq=90.0, cut=cut, caps=(100.0,) * 4, socs=[99.6, 99.6, 99.6 - offset, 99.6]).rows
+
+
+@pytest.mark.parametrize('cut', [False, True], ids=['tail', 'cut-off'])
+def test_a_cell_short_of_full_refuses_the_top_anchor(top_anchors, cut):
+    """5 % below the others: at the tail it sits on the plateau, under 3400
+    mV; after a BMS cut (aTTx: a runner at 3671 mV) it falls there within a
+    minute."""
+    est, pub = run_lfp(_imbalanced(5.0, cut=cut))
+    assert not tops(est) and not est.segments and pub == []
+    assert est.counts['top_cut_not_full' if cut else 'anchor_top'] == (3 if cut else 0)
+
+
+def test_calibration_with_the_floor_on_the_highest_cell_only_the_low_cell_is_taken_as_full(top_anchors, monkeypatch):
+    """Every cell gets 100 %: the low cell's swing reads 5 points too big and
+    the pack's Qmax (its cell's) 6 % low."""
+    monkeypatch.setattr(q, 'TOP_CELL_MIN_MV', 0.0)
+    est, pub = run_lfp(_imbalanced(5.0))
+    assert pub and pub[-1]['qmax'] < 0.95 * 100.0 and pub[-1]['limiting_cell'] == 3
+
+
+def test_monotone_in_how_far_a_cell_is_short_of_full(top_anchors):
+    verdicts = [bool(tops(run_lfp(_imbalanced(off, n=1))[0])) for off in (0.0, 0.1, 0.3, 0.5, 1.0, 2.0, 5.0, 30.0)]
+    _monotone(verdicts)
+    assert verdicts[0] and not verdicts[-1]
+
+
+def test_monotone_in_the_peak_before_a_cut_off(top_anchors):
+    """Lower peaks (an earlier cut on a polarised pack): accepted while the
+    cells a minute later stand above 3400 mV, never again below."""
+    verdicts = [bool(tops(run_lfp(_low_cut(peak=v).rows)[0])) for v in (3700.0, 3650.0, 3600.0, 3560.0, 3540.0,
+                                                                        3480.0, 3400.0)]
+    _monotone(verdicts)
+    assert not verdicts[-1]
+
+
+def test_monotone_in_missing_cell_voltages_at_the_tail(top_anchors):
+    """Voltages missing for longer and longer from the start of the tail:
+    once there is none to hold on, never a top anchor again."""
+    def ok(gap_s):
+        p = LfpPack().rest()
+        p.run(50.0, 3600 * 92 / 50).rest()
+        t0 = p.t
+        p.charge_cv(i_end=4.0)  # stops soon after the tail is reached: the hold ends at rest
+        t1 = p.t
+        p.run(0.0, 1800).run(50.0, 3600 * 30 / 50).end()
+        rows = [(t, i, None if t1 - 300 < t <= t1 - 300 + gap_s else v, temp) for t, i, v, temp in p.rows]
+        return bool(tops(run_lfp(rows)[0]))
+    verdicts = [ok(g) for g in (0.0, 30.0, 120.0, 600.0, 3600.0)]
+    _monotone(verdicts)
+    assert verdicts[0] and not verdicts[-1]
+
+
+def _fast_relaxing_cut(offset=3.0, i_cut=20.0, r1=4.0):
+    """A pack whose fast polarisation is large (r1 4 mOhm, 60 s): CC at
+    i_cut until a BMS cut at 3620 mV, with one cell `offset` % short of full.
+    Right after the cut that cell still reads above 3400 mV; a minute later
+    it is on the plateau."""
+    return lfp_cycles(n=1, dq=90.0, cut=True, i_cut=i_cut, caps=(100.0,) * 4, r1=r1, tau1=60.0,
+                      socs=[99.6, 99.6, 99.6 - offset, 99.6]).rows
+
+
+def test_a_cut_off_is_judged_a_minute_after_the_cut(top_anchors):
+    est, _ = run_lfp(_fast_relaxing_cut())
+    assert not tops(est) and est.counts['top_cut_not_full'] == 1
+
+
+def test_calibration_judged_right_after_the_cut_the_low_cell_passes(top_anchors, monkeypatch):
+    monkeypatch.setattr(q, 'TOP_CUT_SETTLE_S', 0.0)
+    est, _ = run_lfp(_fast_relaxing_cut())
+    assert tops(est), 'scenario is harmless'
+
+
+def test_a_cut_off_from_a_high_current_is_no_charge_end(top_anchors):
+    """At C/2 the cells carry too much polarisation for the minute-after
+    check (TOP_CUT_I_MAX_C)."""
+    est, _ = run_lfp(_fast_relaxing_cut(i_cut=50.0, r1=2.5))
+    assert not tops(est) and est.counts['top_cut_current'] == 1
+
+
+def test_calibration_without_the_current_limit_a_cell_short_of_full_passes_the_cut_check(top_anchors, monkeypatch):
+    monkeypatch.setattr(q, 'TOP_CUT_I_MAX_C', math.inf)
+    est, _ = run_lfp(_fast_relaxing_cut(i_cut=50.0, r1=2.5))
+    assert tops(est), 'scenario is harmless'  # the third cell at 96.6 % taken as full
+
+
+def _sparse_tail(every_s):
+    """A CV charge whose cell voltages come only every `every_s` from the
+    start of the charge to 30 min after it (fetches failing)."""
+    p = LfpPack().rest()
+    p.run(50.0, 3600 * 92 / 50).rest()
+    t0 = p.t
+    p.charge_cv().rest(1800)
+    t1 = p.t
+    p.run(50.0, 3600 * 92 / 50).rest().end()
+    return [(t, i, v if not t0 < t <= t1 or (t - t0) % every_s < p.dt else None, temp) for t, i, v, temp in p.rows]
+
+
+def test_cell_voltages_more_than_a_minute_apart_hold_nothing(top_anchors):
+    """TOP_VOLT_GAP_S on its own: readings every 90 s are real, but a hold
+    needs them at most a minute apart."""
+    assert tops(run_lfp(_sparse_tail(30.0))[0])
+    assert not tops(run_lfp(_sparse_tail(90.0))[0])
+
+
+def test_a_gap_during_the_charge_forgets_its_bulk(top_anchors):
+    """An outage over the turn from bulk to tail: the charge after it has no
+    bulk phase in its record, so no top anchor; the epoch is new anyway."""
+    p = LfpPack().rest()
+    p.run(50.0, 3600 * 92 / 50).rest()
+    p.run(-50.0, 3600 * 85 / 50)
+    p.charge_cv(max_s=1200)  # the bulk ends, CV begins ...
+    n = len(p.rows)
+    p.charge_cv()            # ... and the tail
+    gap = [r[0] for r in p.rows[n - 40:n + 20]]  # 10 minutes without samples around the turn
+    p.rest(1800).run(50.0, 3600 * 92 / 50).rest().end()
+    rows = [r for r in p.rows if r[0] not in gap]
+    est, _ = run_lfp(rows)
+    assert est.counts['gap'] == 1 and not tops(est)
+
+
+def test_a_top_anchor_refuses_a_mosfet_only_temperature(top_anchors):
+    """Rev9, finding 2: during and right after a charge the MOSFET runs warm
+    from the current; it is a cell temperature only at rest (OCV anchors)."""
+    est = q.QmaxEstimator('t', design_capacity=100.0, curve=q.DEFAULT_CURVE)
+    for t, i, v, temp in lfp_cycles(n=1).rows:
+        est.add(t, i, v, temp=temp, temp_mos=True)
+    assert not tops(est) and est.counts['top_temp_mos'] == 1
+    assert est.counts['anchor'] >= 1  # the OCV anchor still takes it
+    assert q.best_temperature(None, [], 23.0) == (23.0, True)
+    assert q.best_temperature(None, [18.0, 20.0, 22.0], 40.0) == (20.0, False)
+    assert q.best_temperature(21.5, [], 40.0) == (21.5, False)
+
+
+def test_calibration_the_mosfet_as_the_cell_temperature_makes_the_top_anchor(top_anchors):
+    est, _ = run_lfp(lfp_cycles(n=1).rows)  # the same temperatures, from a probe
+    assert tops(est)
+
+
+def test_the_sampler_says_when_the_temperature_is_the_mosfets():
+    for bms_, want in ((_Bms(mos=23.0), True), (_Bms(temps=[20.0], mos=23.0), False)):
+        s, _ = _run_sampler(0, bms=bms_, soh_estimator=True)
+        seen, orig = [], s.qmax.add
+        s.qmax.add = lambda *a, **k: (seen.append((k.get('temp'), k.get('temp_mos'))), orig(*a, **k))[1]
+        asyncio.run(s())
+        assert seen and seen[0][1] is want
+
+
+def test_a_top_anchor_needs_a_known_temperature(top_anchors):
+    rows = [(t, i, v, None) for t, i, v, temp in lfp_cycles(n=1).rows]
+    est, _ = run_lfp(rows)
+    assert not tops(est) and est.counts['top_temp_missing'] == 1
+    rows = [(t, i, v, 5.0) for t, i, v, temp in lfp_cycles(n=1).rows]
+    est, _ = run_lfp(rows)
+    assert not tops(est) and est.counts['top_temp_range'] == 1
+
+
+def test_a_cut_off_is_judged_on_a_reading_taken_after_it(top_anchors):
+    """Rev9 (M4): with the voltage fetches failing after the cut, the reading
+    at the cut (polarised, the short cell still at 3415 mV) must not stand in
+    for the check a minute later."""
+    rows = _fast_relaxing_cut()
+    k = next(j for j in range(1, len(rows)) if rows[j - 1][1] < -5 and abs(rows[j][1]) < 1.5
+             and max(rows[j - 1][2]) > 3550)
+    rows = [(t, i, None if k < j <= k + 18 else v, temp) for j, (t, i, v, temp) in enumerate(rows)]
+    est, _ = run_lfp(rows)
+    assert not tops(est) and est.counts['top_cut_unverified'] == 1
+
+
+def test_a_discharge_is_no_tail(top_anchors):
+    """Rev9 (M5): the charger stops at 4.5 A and a 1.2 A load (above the rest
+    threshold) runs; on a pack without hysteresis the cells stay in the band.
+    The tail is a charge current of at most C/20, or about none."""
+    p = LfpPack(hyst=0.0).rest()
+    p.run(50.0, 3600 * 92 / 50).rest()
+    p.charge_cv(i_end=4.5)
+    p.run(1.2, 1800).run(50.0, 3600 * 60 / 50).rest().end()
+    assert not tops(run_lfp(p.rows)[0])
+
+
+def _glitch_at_the_top(cut):
+    """60 s sampling. A garbled frame that reads 450 A of charge (7.5 Ah,
+    below the 500 A bound), then a caught glitch; then the tail (or,
+    cut: the BMS cut two samples after the glitch). The glitch's neighbourhood
+    is judged 5 samples later -- after the 3-minute hold, and after the
+    cut-off's check a minute on."""
+    rows = list(lfp_cycles(n=1, cut=cut, dt=60.0).rows)
+    if cut:
+        c = next(j for j in range(1, len(rows)) if rows[j - 1][1] < -5 and abs(rows[j][1]) < 1.5)
+        bad, glitch = (c - 4,), c - 2  # (the last charging sample before the cut must be a good one)
+    else:
+        k = next(j for j in range(1, len(rows)) if -5 <= rows[j][1] < 0 and rows[j - 1][1] < -5) + 12
+        bad, glitch = (k - 2,), k - 1  # 12 minutes into the tail (60 s steps overshoot at its start)
+    for j in bad:
+        t, _, v, temp = rows[j]
+        rows[j] = (t, -450.0, v, temp)
+    t, _, v, temp = rows[glitch]
+    rows[glitch] = (t, -3000.0, v, temp)
+    return rows
+
+
+@pytest.mark.parametrize('cut', [False, True], ids=['tail', 'cut-off'])
+def test_a_top_anchor_waits_for_a_glitchs_neighbourhood(top_anchors, cut):
+    """Rev9 (M13/M14): at >= 40 s sampling the hold (or the cut-off check)
+    completes before the glitch is judged; taken then, its segment counts the
+    garbled 7.5 Ah. It waits, the neighbourhood refuses, the epoch ends."""
+    est, _ = run_lfp(_glitch_at_the_top(cut))
+    assert est.counts['current_implausible_neighbours'] == 1
+    assert not tops(est) and not est.segments
+
+
+@pytest.mark.parametrize('cut', [False, True], ids=['tail', 'cut-off'])
+def test_calibration_without_the_wait_the_garbled_charge_is_published_in_the_segment(top_anchors, cut, monkeypatch):
+    step = q.QmaxEstimator._top_step
+
+    def no_wait(self, *a, **k):
+        nb, self._glitch_nb = self._glitch_nb, None
+        try:
+            return step(self, *a, **k)
+        finally:
+            self._glitch_nb = nb if self._glitch_nb is None else self._glitch_nb
+    monkeypatch.setattr(q.QmaxEstimator, '_top_step', no_wait)
+    est, _ = run_lfp(_glitch_at_the_top(cut))
+    assert est.segments, 'scenario is harmless'
+    assert est.segments[0]['kinds'] == ['ocv', 'top'] and est.segments[0]['qmax'] > 1.06 * 98.0  # +8 %
+
+
+# ---- the gates of a segment still apply
+
+def test_a_gap_between_a_charge_end_and_the_rest_near_empty_ends_the_segment(top_anchors):
+    p = LfpPack().rest()
+    p.run(50.0, 3600 * 92 / 50).rest()
+    p.charge_cv().rest(1800)
+    p.run(50.0, 1800).run(50.0, 1800, sample=False).run(50.0, 3600 * 92 / 50 - 3600).rest().end()
+    est, _ = run_lfp(p.rows)
+    assert [s['kinds'] for s in est.segments] == [['ocv', 'top']] and est.counts['gap'] == 1
+
+
+def test_the_drift_budget_applies_to_a_top_anchored_segment(top_anchors):
+    """Full, then 92 Ah out over two days at 2 A: 0.3 A x 46 h is 15 %."""
+    p = LfpPack().rest()
+    p.run(50.0, 3600 * 92 / 50).rest()
+    p.charge_cv().rest(1800)
+    p.run(2.0, 3600 * 92 / 2).rest().end()
+    est, _ = run_lfp(p.rows)
+    assert est.pair_reasons['drift'] >= 1 and [s['kinds'] for s in est.segments] == [['ocv', 'top']]
+
+
+def test_the_plausibility_window_and_the_capacity_check_apply_to_top_anchored_segments(top_anchors):
+    rows = [(t, 1.3 * i, v, temp) for t, i, v, temp in lfp_cycles().rows]  # a 1.3x gain
+    est, pub = run_lfp(rows)
+    assert tops(est) and pub == [] and est.pair_reasons['implausible'] >= 3
+    est = q.QmaxEstimator('t', design_capacity=100.0, curve=q.DEFAULT_CURVE)
+    pub = [r for t, i, v, temp in lfp_cycles().rows if (r := est.add(t, i, v, temp=temp, capacity=200.0))]
+    assert len(est._counted()) == 5 and pub == []  # the BMS says 200 Ah
+
+
+def test_a_restart_during_the_tail_costs_that_top_anchor(top_anchors):
+    """The charge in progress is not saved (its voltages would have a hole
+    anyway), so a restart during the hold costs that top anchor -- and the
+    segment: the BMS reads SoC 99 % there, where its counter may be held at
+    full (the stop rule), so the restart ends it anyway."""
+    p = lfp_cycles(n=1)
+    whole, _ = run_lfp(p.rows, **bms(p))
+    t_top = tops(whole)[0]['t']
+    cut = next(k for k, r in enumerate(p.rows) if r[0] >= t_top - 60)
+    split, _ = _split_run(p.rows, [cut], curve=q.DEFAULT_CURVE, **bms(p))
+    assert len(tops(whole)) == 1 and whole.segments and not tops(split) and not split.segments
+    assert split.counts['restart_unverified'] == 1
+
+
+def test_the_sampler_fetches_voltages_while_charging_only_with_a_capacity():
+    s, bms_ = _run_sampler(25, bms=_Bms(current=-30.0), soh_estimator=True, design_capacity=100.0)
+    assert bms_.n_voltage_fetches == pytest.approx(1 + 25 / q.VOLTAGE_PERIOD_S, abs=1)
+    s, bms_ = _run_sampler(25, bms=_Bms(current=-30.0), soh_estimator=True)
+    assert bms_.n_voltage_fetches == 1  # the first, publishing cycle
+    s, bms_ = _run_sampler(25, bms=_Bms(current=30.0), soh_estimator=True, design_capacity=100.0)
+    assert bms_.n_voltage_fetches == 1  # discharging: no
+
+
+def test_a_top_anchor_restored_with_another_shape_does_not_validate(top_anchors):
+    est, _ = run_lfp(lfp_cycles().rows)
+    st = _via_json(est.get_state())
+    k = next(j for j, a in enumerate(st['anchors']) if a['kind'] == 'top')
+    for bad in (dict(soc=[99.0] * 4), dict(mode='guess'), dict(kind='full'), dict(temp=5.0), dict(i_rest=0.7)):
+        s2 = _via_json(st)
+        s2['anchors'][k].update(bad)
+        assert not _fresh().restore(s2), bad
+    s2 = _via_json(st)
+    s2['segments'][0]['kinds'] = ['top', 'top']
+    assert not _fresh().restore(s2)
+    assert _fresh().restore(st)
 
 
 # ================================================================ MQTT
@@ -2203,6 +3805,129 @@ def test_publish_qmax_leaves_out_an_unknown_soh(monkeypatch):
     assert float(c.published['dev/qmax_est']) == pytest.approx(pub[-1]['qmax'], rel=1e-3)
     assert 'dev/soh_est' not in c.published
     assert json.loads(c.published['dev/qmax_est/attributes'])['plausibility_checked'] is False
+
+
+# ================================================================ withdrawal (rev8, finding 2)
+
+def _published_state():
+    est, pub = _with_bms_capacity(full_cycles(n=3).rows, 100.0, cap=100.0)
+    assert pub
+    return est, _via_json(est.get_state(full=True))
+
+
+def test_a_corrected_capacity_option_withdraws_what_was_published():
+    """The option corrected (the state is discarded) or changed code: the
+    first sample after the start clears the estimate an earlier run put out.
+    The same state under the same option still publishes: nothing withdrawn."""
+    _, st = _published_state()
+    est = _fresh(cap=280.0)
+    est.restore(st)
+    est.add(T0 + 30 * 86400, 0.0, None)
+    assert est.result() is None and est.take_withdrawal() and est.take_withdrawal() is None
+    est = _fresh(cap=100.0)
+    assert est.restore(st) and est.result() is not None
+    est.add(st['last_t'] + 10, 0.0, None, capacity=100.0)
+    assert est.take_withdrawal() is None
+
+
+def test_a_capacity_mismatch_that_starts_later_withdraws_what_was_published():
+    """The BMS's figure moves to twice the option and stays there (a second
+    pack's worth set in the BMS): withdrawn once the hourly median follows."""
+    est, _ = _published_state()
+    t = est._last_t
+    seen = []
+    for k in range(1, q.BMS_CAP_N + 1):
+        est.add(t + 3600 * k, 0.0, None, capacity=200.0)
+        seen.append(est.take_withdrawal())
+    hit = [k for k, w in enumerate(seen) if w]
+    assert len(hit) == 1 and est.result() is None
+    assert hit[0] == q.BMS_CAP_N // 2 - 1  # at the 12th of 24 hourly readings the median is 150 Ah: 1.5x
+
+
+def test_a_disabled_estimator_withdraws_what_was_published():
+    est, _ = _published_state()
+    est.disable('test')
+    assert est.take_withdrawal()
+
+
+def _sampler_with_state(st, client, cap, monkeypatch):
+    import bmslib.mqtt_util as mu
+    monkeypatch.setattr(mu, '_last_values', {})
+    s = BmsSampler(_Bms(current=0.0), mqtt_client=client, dt_max_seconds=120, expire_after_seconds=60,
+                   publish_period=3600, soh_estimator=True, design_capacity=cap, soh_state=st)
+    s.num_samples = 1
+    s._last_power = 0.0
+    asyncio.run(s())
+    return s
+
+
+@pytest.mark.parametrize('how', ['option corrected', 'restored disabled'])
+def test_the_sampler_clears_a_withdrawn_estimate_in_home_assistant(how, monkeypatch):
+    """Through the real call path, to the MQTT topics: Home Assistant takes
+    the payload None as unknown."""
+    _, st = _published_state()
+    if how == 'restored disabled':
+        st['disabled_reason'] = 'the median cell voltage has been outside 2500..3700 mV'
+    c = _Client()
+    _sampler_with_state(st, c, 280.0 if how == 'option corrected' else 100.0, monkeypatch)
+    assert c.published['q_fake/qmax_est'] == 'None' and c.published['q_fake/soh_est'] == 'None'
+    c = _Client()
+    _sampler_with_state(_published_state()[1], c, 100.0, monkeypatch)  # still publishable: left as it is
+    assert 'q_fake/qmax_est' not in c.published
+
+
+class _FlakyClient(_Client):
+    """A broker that refuses publishes while `down`."""
+    down = True
+
+    def publish(self, topic, payload, retain=False):
+        if self.down:
+            class R:
+                rc = paho.MQTT_ERR_NO_CONN
+            return R()
+        return super().publish(topic, payload, retain)
+
+
+def test_a_withdrawal_that_fails_is_sent_again_and_repeated_hourly(monkeypatch):
+    """Rev9, finding 6: it was one publish whose failure was dropped, and Home
+    Assistant then restored the old SoH (it keeps an MQTT sensor's state over
+    its own restarts until expire_after: a year). It is retried until it goes
+    through, and sent again every hour while nothing may be published, for a
+    Home Assistant that was down when it went."""
+    _, st = _published_state()
+    c = _FlakyClient()
+    s = _sampler_with_state(st, c, 280.0, monkeypatch)
+    assert 'q_fake/qmax_est' not in c.published and s._qmax_clear[1] is None
+    c.down = False
+    asyncio.run(s())
+    assert c.published['q_fake/qmax_est'] == 'None' and c.published['q_fake/soh_est'] == 'None'
+    c.published.clear()
+    asyncio.run(s())
+    assert 'q_fake/qmax_est' not in c.published  # not every sample
+    s._qmax_clear[1] -= q_mqtt.QMAX_CLEAR_REPEAT_S + 1  # an hour later ...
+    for k, (t_pub, data) in list(q_mqtt._last_values.items()):  # (... for the unchanged-value filter too)
+        q_mqtt._last_values[k] = (t_pub - q_mqtt.QMAX_CLEAR_REPEAT_S - 1, data)
+    asyncio.run(s())
+    assert c.published['q_fake/qmax_est'] == 'None'
+
+
+def test_calibration_sent_once_a_failed_withdrawal_is_lost(monkeypatch):
+    monkeypatch.setattr(BmsSampler, '_withdraw_qmax', lambda self: (
+        q_mqtt.withdraw_qmax(self.mqtt_client, self.mqtt_topic_prefix) if self.qmax.take_withdrawal() else None))
+    _, st = _published_state()
+    c = _FlakyClient()
+    s = _sampler_with_state(st, c, 280.0, monkeypatch)
+    c.down = False
+    asyncio.run(s())
+    assert 'q_fake/qmax_est' not in c.published  # HA keeps the old SoH
+
+
+def test_calibration_without_the_withdrawal_the_old_estimate_stays(monkeypatch):
+    monkeypatch.setattr(q.QmaxEstimator, 'take_withdrawal', lambda self: None)
+    _, st = _published_state()
+    c = _Client()
+    s = _sampler_with_state(st, c, 280.0, monkeypatch)
+    assert s.qmax.result() is None and 'q_fake/qmax_est' not in c.published  # HA keeps the old SoH for a year
 
 
 # ================================================================ sampler wiring

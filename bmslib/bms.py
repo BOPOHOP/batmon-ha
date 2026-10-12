@@ -31,6 +31,33 @@ class PowerMonitorSample:
         pass
 
 
+def derive_charge_fields(soc, charge, capacity, soh, aged_capacity):
+    """What BmsSample derives from the charge fields a driver reported ->
+    (soc, capacity, soh, aged_capacity). A function of its own because the
+    Qmax/SoH estimator's saved state depends on it (its stop rule reads the
+    SoC and both capacities): bmslib/qmax.py fingerprints this code with its
+    own."""
+    # infer soc from capacity if soc is nan or type(soc)==int (for higher precision)
+    if capacity > 0 and (math.isnan(soc) or (isinstance(soc, int) and charge > 0)):
+        soc = round(charge / capacity * 100, 2)
+    elif math.isnan(capacity) and soc > .2 and not math.isnan(charge):
+        # guard `charge`: round(nan) is int(nan) which raises ValueError, so a
+        # sample with a known soc but unknown charge must skip this derivation.
+        capacity = round(charge / soc * 100)
+
+    # assert math.isfinite(soc)
+
+    # Derive SOH↔aged_capacity if only one was provided and capacity is known.
+    # Both may also be set explicitly by decoders (e.g. JK BMS exposes both
+    # separately and they don't perfectly round-trip the formula).
+    if capacity > 0:
+        if math.isnan(aged_capacity) and not math.isnan(soh):
+            aged_capacity = capacity * soh / 100
+        elif math.isnan(soh) and not math.isnan(aged_capacity):
+            soh = aged_capacity / capacity * 100
+    return soc, capacity, soh, aged_capacity
+
+
 class BmsSample:
     def __init__(self, voltage, current, power=math.nan,
                  charge=math.nan, capacity=math.nan, total_charge_throughput=math.nan,
@@ -72,24 +99,15 @@ class BmsSample:
         self._power = power  # 0 -> +0
         self.balance_current = balance_current
 
-        # infer soc from capacity if soc is nan or type(soc)==int (for higher precision)
-        if capacity > 0 and (math.isnan(soc) or (isinstance(soc, int) and charge > 0)):
-            soc = round(charge / capacity * 100, 2)
-        elif math.isnan(capacity) and soc > .2 and not math.isnan(charge):
-            # guard `charge`: round(nan) is int(nan) which raises ValueError, so a
-            # sample with a known soc but unknown charge must skip this derivation.
-            capacity = round(charge / soc * 100)
+        # The SoC as the driver reported it, before the derivation below may
+        # replace it. An integer SoC of 100 % next to a remaining charge that
+        # tops out below `capacity` (an aged pack whose BMS counts against its
+        # learnt full capacity, e.g. supervolt) becomes 93 % here; the Qmax
+        # estimator's stop rule must still see that the BMS said full. Not
+        # part of values(): sinks get the SoC as before.
+        self.soc_reported = soc
 
-        # assert math.isfinite(soc)
-
-        # Derive SOH↔aged_capacity if only one was provided and capacity is known.
-        # Both may also be set explicitly by decoders (e.g. JK BMS exposes both
-        # separately and they don't perfectly round-trip the formula).
-        if capacity > 0:
-            if math.isnan(aged_capacity) and not math.isnan(soh):
-                aged_capacity = capacity * soh / 100
-            elif math.isnan(soh) and not math.isnan(aged_capacity):
-                soh = aged_capacity / capacity * 100
+        soc, capacity, soh, aged_capacity = derive_charge_fields(soc, charge, capacity, soh, aged_capacity)
 
         self.charge: float = charge
         self.capacity: float = capacity
@@ -146,7 +164,9 @@ class BmsSample:
         return (self.voltage * self.current) if math.isnan(self._power) else self._power
 
     def values(self):
-        return {**self.__dict__, "power": self.power}
+        d = {**self.__dict__, "power": self.power}
+        d.pop('soc_reported', None)
+        return d
 
     def __str__(self):
         # noinspection PyStringFormat

@@ -2,6 +2,11 @@
 Experimental online Qmax / state-of-health estimator for LiFePO4 packs, per
 BMS, in pure Python.
 
+Two kinds of anchor: a relaxed rest whose OCV gives each cell's SoC (below),
+and the end of a charge, where every cell is taken as 100 % (the top anchor,
+TOP_* constants: on the built-in curve rests give a SoC only near empty, so
+only a rest paired with a charge end can swing far enough).
+
 Port of the Qmax part of the offline Impedance-Track prototype in the
 bat-impedance project (`qmax_soh.py`, `cell_degradation.py`, `ocv_table.py`;
 WHITEPAPER sections 2.1, 6 and 8). Between two relaxed rests the state of
@@ -39,7 +44,8 @@ plausible wrong number without it:
  * A known temperature inside the range the curve was measured at. Missing
    temperature makes the anchor unevaluable; it is never defaulted. At rest the
    MOSFET temperature is close to the cell's (WHITEPAPER 7), so the caller may
-   pass it when there is nothing better.
+   pass it when there is nothing better (flagged temp_mos: a top anchor, which
+   comes during or right after a charge, refuses it).
  * Voltages are the per-minute median, and the last value is the median of the
    last END_BINS minutes after removing isolated single-minute spikes: one
    garbled reading at the end of a rest must not move the anchor.
@@ -51,12 +57,12 @@ it cannot be paired), but keeps the anchors; a shorter one is bridged
 linearly. A current no pack can carry (a decode glitch, above I_MAX_C_RATE x
 capacity or I_MAX_ABS_A, estimator_common) is never integrated and is no
 sample: an isolated one leaves a hole that the next good sample bridges under
-the same rule, as if it had not come -- but only if that sample and the one
-before the hole agree (GLITCH_AGREE_*): a garbled frame next to a caught one
-reads like a current, and the bound cannot catch it. Otherwise, and at a
-second rejection within GLITCH_ISOLATION_S of the last, the epoch ends like a
-long gap: a burst of garbled frames says that the readings around them may be
-garbled too. A
+the same rule, as if it had not come -- but only if the GLITCH_NB_N good
+samples either side of the hole agree with their local level
+(GLITCH_AGREE_*): a garbled frame next to a caught one reads like a current,
+and the bound cannot catch it. Otherwise, and at a second rejection within
+GLITCH_ISOLATION_S of the last, the epoch ends like a long gap: a burst of
+garbled frames says that the readings around them may be garbled too. A
 clock step back (a sample
 more than REORDER_TOL_S older than the last one; one less old is skipped like
 a duplicate) does more: every anchor and segment timed after the
@@ -81,19 +87,37 @@ at either end, no resolution learnt yet, no capacity, another counter than
 before (charge_counter), or a counter that may be held at a stop at either
 end -- or against it, the restart ends the epoch like a gap.
 
-A counter at a stop does not count what still flows. At its full end (SoC
-100 %, or the remaining charge at the capacity the BMS is set to) charge still
-goes into cells that hold more than that (grade-A LFP holds 105-110 % of its
-nameplate), and at its empty end charge can still come out. A counter held
+A counter at a stop does not count what still flows. At its full end charge
+still goes into cells that hold more than that (grade-A LFP holds 105-110 % of
+its nameplate), and at its empty end charge can still come out. A counter held
 there reads "moved 0" while the host was off with its clock frozen, and the
 third review published 95.0 / 91.7 / 87.3 Ah for a 98 Ah pack with 3 / 6 / 10
-Ah hidden that way. So a reading within COUNTER_STOP_PCT of either end, or one
-without a SoC to tell, is no evidence. Not covered: a counter that runs into a
-stop and back out while the host is off (charged to full, then discharged by
-what it had counted), or one that stops counting less than RESUME_TOL_FRAC of
-the capacity before the shutdown and still reads the same after it (the
-frozen-clock case above then still publishes 49 Ah for 98) -- both read like
-a pack at rest.
+Ah hidden that way. So a reading is no evidence when anything says it may be
+at a stop: a SoC within COUNTER_STOP_PCT of either end, the SoC the BMS reports
+or the SoC as the driver reported it (bms_soc_raw: BmsSample replaces an
+integer SoC by charge / capacity, so an aged pack whose counter tops out at its
+learnt full capacity, 0.97 x the design capacity it reports, read 97 % at
+full, and the fourth review published those numbers again); a reading within
+the counter's resolution of 0, of the capacity the BMS reports, of the aged
+capacity it reports (BmsSample.aged_capacity), or of the highest reading of
+this counter seen so far (a learnt full end that nothing reports); a reading
+without any SoC, or one more than the pack can hold. What the highest reading
+costs: a counter back at the top it reached before is refused at a restart
+whether it is held there or not (a pack that charges to the same counter value
+every cycle); one garbled reading below PLAUSIBLE_REL[1] x the capacity raises
+it for good and turns that one test off. Not covered: a counter that runs into
+a stop and back out while the host is off (charged to full, then discharged by
+what it had counted), a full end that moved below the counter's highest
+reading and that nothing reports -- they read like a pack at rest. A counter
+that stops counting less than RESUME_TOL_FRAC of the capacity of charge (moved
+either way, not net) before the shutdown and still reads the same after it
+passes the restart's check too (the frozen-clock case above published 49 Ah
+for 98 that way); so a continued restart is checked again afterwards
+(_audit_step): every pair across it is held back until the counter is seen
+moving with the current, and the epoch ends there if it stays put or comes
+back with what it missed. Still not covered: a counter that stopped only
+while the host was off and counts normally again after it (it missed what the
+bridge missed).
 
 Segments are accepted with the tightened universal gates from the prototype's
 TODO: every cell on a steep part of the curve at both ends, |dSoC| >= 60 % for
@@ -123,7 +147,11 @@ the assumed 0.3 A was 3.4 %. What is published says so: offset_assumed_a and
 offset_drift_pct, the drift at that assumed offset.
 
 The capacity is the per-device `capacity:` option (the nameplate) and
-nothing else. Without it nothing is accepted, neither SoH nor Qmax alone:
+nothing else. Saved anchors and segments are only restored under the option
+they were measured against (another one means a corrected option or another
+pack), and what is published is the median of the segments that still pass
+the plausibility window of the present option and have the newest segment's
+cell count (_counted). Without it nothing is accepted, neither SoH nor Qmax alone:
 the plausibility check is then unevaluable, and it is the only one that
 catches a wrong current scale (a shunt setting off by 3x) or a glitch below
 the input bound. The capacity the BMS reports is never the reference. It is
@@ -133,12 +161,17 @@ driver it is not even a setting but round(charge / SoC * 100) per sample
 (bms.py), which swings between 160 and 300 Ah below 1.1 % SoC. And as the
 reference of the plausibility window it would vouch for Qmax with a number
 from the same unchecked configuration as the current scale: set to 150 Ah,
-it let a 1.4x gain error through as 137 Ah for a 98 Ah pack.
+it let a 1.4x gain error through as 137 Ah for a 98 Ah pack. It is a sanity
+check of the option only: nothing is published when the two differ by more
+than CAPACITY_MISMATCH_MAX (the option set to a bank's capacity).
 
 STRUCTURAL CONSEQUENCE, measured and not hidden: on the built-in curve the
 smoothed slope reaches 5 mV/% only between 0 and 11 % SoC; its top is flat
-(< 1 mV/%). So with these gates no segment can be accepted on THIS curve; see
-doc/SoH.md for the replay numbers and what relaxing a gate would cost. That is
+(< 1 mV/%). So with these gates no pair of rests can be accepted on THIS
+curve; see doc/SoH.md for the replay numbers and what relaxing a gate would
+cost. The top anchor exists because of that: a rest near empty and a charge
+end swing ~90 %. Its 100 % is full as the charger defines it, a few % at most
+below the cells' own, so it biases Qmax low, never high (doc/SoH.md). That is
 a property of this curve and the data it was built from, not a shown property
 of relaxed LiFePO4: the data holds no relaxed minute above 99.61 % BMS SoC or
 3333 mV, the curve's top end is extrapolated from there, and TI treats relaxed
@@ -151,11 +184,13 @@ Chemistry: LiFePO4 only, the same persistent-out-of-band rule as the cell
 resistance estimator (bmslib/estimator_common.py).
 """
 import copy
+import logging
 import math
 import threading
 from collections import Counter, deque
 from typing import Any, Dict, List, Optional, Sequence, Tuple
 
+from bmslib import bms as _bms
 from bmslib import estimator_common
 from bmslib.estimator_common import (CHEM_PERSIST_N, CHEM_PERSIST_S, I_MAX_ABS_A, I_MAX_C_RATE, LFP_MV_HI,
                                      LFP_MV_LO, chemistry_step, current_ceiling, finite, fmt_t, locked, median,
@@ -253,9 +288,10 @@ MAX_GAP_S = 300.0
 # order as what the linear bridge itself may cost (above: 1.7 %), and it lets a
 # counter with 1 % steps (an integer SoC) continue across a restart at rest.
 RESUME_TOL_FRAC = 0.02
-# A counter reading within this many % of SoC of either end (or within its
-# resolution of 0 or of the capacity the BMS reports) may be held at a stop
-# and is no evidence across a restart (module doc). 1 %: one step of an integer
+# A counter reading within this many % of SoC of either end, by the SoC the
+# BMS reports or the one the driver reported (or within its resolution of 0,
+# of the capacity or aged capacity the BMS reports, or of its highest reading)
+# may be held at a stop and is no evidence across a restart (module doc). 1 %: one step of an integer
 # SoC, the coarsest the drivers report, so that a counter one step short of
 # its stop is covered too. What it costs: a restart at the top of a charge (a
 # pack resting at 99-100 %) ends the open segment.
@@ -265,16 +301,30 @@ COUNTER_STOP_PCT = 1.0
 # is what the real 2^31 mA JK glitch looks like; ending the epoch on it threw
 # away segments identical to the clean run once the hole was bridged.
 GLITCH_ISOLATION_S = MAX_GAP_S
-# ... and only when the good samples either side of it agree, within
-# max(GLITCH_AGREE_A, GLITCH_AGREE_REL x the larger of the two): garbled frames
-# come in runs, and one next to a caught glitch reads like a current. Without
-# this, 1 / 2 / 4 frames of 450 A beside one caught glitch per discharge were
-# counted, 99.4 / 100.6 / 103.0 Ah for 97.5 (third review). A real load step
-# right at a glitch costs the open segment, never a value. What still passes:
-# a garbled neighbour within the tolerance (at most 25 % of the load for one
-# sample interval), and a run of frames that all read the same wrong value.
+# ... and only when the GLITCH_NB_N good samples before it and the
+# GLITCH_NB_N after it all lie within max(GLITCH_AGREE_A, GLITCH_AGREE_REL x
+# |their median|) of their median: garbled frames come in runs, and one next
+# to a caught glitch reads like a current. Comparing only the two samples
+# beside the hole (third review's fix) let runs on BOTH sides through, the
+# neighbours then agreeing with each other: 1 / 2 / 4 frames of 450 A either
+# side of one caught glitch per load published 101.2 / 103.7 / 108.6 Ah for
+# 97.5 (fourth review). The median is the local current level: one garbled
+# frame does not move it, so it stands out against it; a level, not a fitted
+# line, because a line through the window is pulled towards the garbage. The
+# decision waits for the samples after the glitch; a break then ends the
+# epoch there, which is early enough, since an anchor needs a 90-minute rest
+# and the window is GLITCH_NB_N samples. Unevaluable (fewer than GLITCH_NB_N
+# good samples before it, as after a fresh start, or another glitch, a gap or
+# an unconfirmed restart before the window is full) ends the epoch too. A real
+# load change within the window costs the open segment, never a value. What
+# still passes is whatever the window allows: values within the tolerance of
+# its median, garbled or not (up to 25 % of the load for one sample interval
+# each), and runs of GLITCH_NB_N or more garbled frames on both sides that
+# agree with each other within it. GLITCH_NB_N = 5: the review's runs went 4
+# deep. What it costs on real data: doc/SoH.md.
 GLITCH_AGREE_A = 1.0
 GLITCH_AGREE_REL = 0.25
+GLITCH_NB_N = 5
 # A sample at most this much older than the last one is skipped like a
 # duplicate, and nothing is dropped: a reordered frame, a clock that jitters or
 # is stepped back by a fraction of a second. Each such step used to drop the
@@ -333,7 +383,143 @@ REQUIRE_CAPACITY = True
 # genuinely failing cell (SoH 50 %) is reported, not rejected; the price is
 # that a gain down to 0.4 passes.
 PLAUSIBLE_REL = (0.4, 1.2)
-MAX_ANCHORS = 16  # evaluable anchors kept; rests of >= 90 min come ~1-2 a day, MAX_SEGMENT_S is 10 days
+# The option is checked against what the BMS reports as its capacity: nothing
+# is published when one is more than this factor of the other. The window
+# above cannot see an option entered for the whole bank: a 100 Ah pack in a
+# bank of two with the option at 200 published SoH 48.8 % with the check
+# passed (0.4 x 200 = 80 < 97.5). The BMS's figure is a sanity check only,
+# never the reference (it is a setting nobody checked, or derived); without
+# one, nothing changes. 1.25, tightened from 1.5 (rev8): at 1.5 an option
+# entered for a bank of UNEQUAL packs passed, e.g. 380 for the 280 Ah pack of
+# a 280 + 100 Ah bank (1.36), and a 100 Ah pack with the option at 120 / 140 /
+# 150 went out as SoH 81.3 / 69.7 / 65.0 %, plausibility checked. At 1.25 a
+# bank figure is caught when the other packs add more than a quarter of this
+# one; a BMS set to its usable capacity (0.8-1.0 of nameplate) still passes.
+# What it costs: a pack whose BMS reports its learnt capacity as the capacity
+# (braunpwr_uart, renogy_uart, JK through aiobmsble) is refused below SoH 80 %
+# (it was 67 %), the usual end-of-life mark, where the BMS's own figure says
+# the same thing; and an option within 1.25x of a wrong BMS setting is not
+# caught. The figure is the median of one reading per hour over the last
+# BMS_CAP_N hours: the derived capacity of the legacy Daly driver swings near
+# empty (160-300 Ah for 280), and a mismatch now withdraws what was published
+# (take_withdrawal), so it must persist for half a day to count.
+CAPACITY_MISMATCH_MAX = 1.25
+BMS_CAP_PERIOD_S = 3600.0
+BMS_CAP_N = 24
+# Evaluable anchors kept: rests of >= 90 min come ~1-2 a day and a top anchor
+# with each full charge, so 16 reach back 5-8 days; the drift budget limits a
+# segment to 15-33 h anyway.
+MAX_ANCHORS = 16
+
+# ---------------------------------------------------------------- top anchor: charge termination
+# The built-in curve gives a SoC only near empty, so no pair of OCV anchors can
+# reach MIN_DSOC. The top anchor is the end of a charge, the way battery
+# monitors synchronise to 100 % (Victron: voltage above its "charged voltage"
+# and current below its "tail current" for its "charged detection time"):
+# every cell at SoC 100 %, at the moment the charge terminated. That is full as
+# THIS charger defines it, not the cell's 100 % (doc/SoH.md): Qmax is then the
+# charge between that full and the bottom anchor's OCV SoC, scaled to the
+# cells' 0-100 %. A charge ends one of two ways:
+#  * tail: after a bulk phase the charge current stays at most the tail while
+#    the highest cell holds (CV: not rising, within a band of its recent
+#    peak), for TOP_HOLD_S, every cell at TOP_CELL_MIN_MV or more;
+#  * cut-off: the current drops in one sample from above the tail to about 0
+#    (a BMS cell-overvoltage cut, a charger that terminates) after the highest
+#    cell peaked at TOP_CUTOFF_MV or more, and TOP_CUT_SETTLE_S later every
+#    cell is still at TOP_CELL_MIN_MV or more.
+# Unevaluable is never full: no capacity (the tail and bulk are fractions of
+# it), cell voltages missing, older than TOP_VOLT_GAP_S or dropped by the
+# chemistry guard, a cell count that changes, no temperature, a gap, a clock
+# step, or a glitch decision still open. Only the highest and lowest cells are
+# used, so the cost per sample is small (doc/SoH.md). The state of a charge in
+# progress is not saved: a restart during one costs that one top anchor.
+TOP_ANCHORS = True  # (a switch only for the tests on SYNTH, whose synthetic relaxed top would read 97 % as full)
+# Tail current: C/20. Victron's default is 4 % of the capacity; 0.05C is the
+# CV termination LFP cell datasheets give (e.g. EVE LF280K: 0.5C CC to 3.65 V,
+# CV to 0.05C), and the current the evidence for TOP_CELL_MIN_MV was taken at.
+TOP_TAIL_C = 0.05
+# Every cell must stand at TOP_CELL_MIN_MV or more: the anchor gives each one
+# 100 %, and a cell below it is not near full, whatever the highest one says
+# (an imbalanced pack; the per-cell rule is what MIN_DSOC "every cell" needs).
+# Evidence: bat-impedance top_floor_stat.py, the maintainer's van pack (280
+# Ah, two cells logged; Daly 11 and ANT 38 charges that reached 3550 mV): the
+# charge that still went in after the LOWEST cell first stood in a band under
+# 0.3 A..C/20, until the highest reached 3550 mV, % of 280 Ah, at 15 degC and
+# more (Daly / ANT): 3400-3405 mV max 2.0 (n=4) / 4.7 (n=7), 3405-3410 0.7
+# (3) / 4.3 (7), 3410-3420 1.1 (5) / 3.6 (7); one band down, 3390-3400, still
+# 2.7 (5) / 4.8 (10), so a cell reading 10 mV high costs about 5 %; two bands
+# down, 3380-3390, 7.6 (6) / 10.0 (16): a BMS whose cells read 20 mV high
+# puts a top anchor up to ~10 % short (not guarded; counts are small). Below
+# 15 degC the same 3390-3400 band left 16.2 (3) / 7.0 (2) % (TOP_TEMP_LO). By
+# the HIGHEST cell instead, up to 7.9 / 18.6 % at 3400-3420. In telemetry
+# (aTTx, 16 cells) a BMS cut at a 3671 mV runner left a cell at 3362 mV a
+# minute later: not full.
+TOP_CELL_MIN_MV = 3400.0
+# A bulk phase: TOP_BULK_SUSTAIN_S of minute means in a row, each a charge
+# current of TOP_BULK_C x capacity or more, ending within the last
+# TOP_BULK_S; and the tail must have fallen to TOP_TAPER x the lowest of them
+# (a CV taper), not just be a weaker source. Rev9: on the van's cold morning
+# (2025-11-21, 10-12 degC) both cells stood at 3398-3412 mV under C/20 with
+# 12-16 % still to go, and only the old bulk rule (one sample at C/13.3 or
+# more) held it off by 2 A: a 22 A minute and a 10 % weaker sun made a top
+# anchor 12 % short. One minute is no bulk now, and the C/20 after a 22 A bulk
+# is no taper; a real DC-DC bulk (30 A for 20 min) passes both, and what then
+# refuses that morning is TOP_TEMP_LO. C/13.3, 1.5x the tail: the van's solar
+# charger rarely reaches C/10. 5 minutes: 10 cost the van's Daly data 12 of
+# its 14 top anchors (at 5: 9) and 1j6d 9 of 43 (at 5: 5); the warm floor
+# evidence above holds for weak and strong bulks alike (it walks back from
+# every charge end). The taper costs no top anchor in the telemetry or van
+# replays.
+TOP_BULK_C = 0.075
+TOP_BULK_S = 2 * 3600.0
+TOP_BULK_SUSTAIN_S = 300.0
+TOP_TAPER = 0.5
+# Victron's default charged detection time, with at least TOP_HOLD_READINGS
+# cell voltage readings in it (one is no hold).
+TOP_HOLD_S = 180.0
+TOP_HOLD_READINGS = 3
+# CV: the highest cell may rise by at most TOP_RISE_MV during the hold (a new
+# hold starts above it). In CV it still rises a little as the cable drop
+# shrinks with the current (3-5 mV in 3 min at the tail, LCjx, 1 s cell
+# data); in the CC knee it rises 30-90 mV a minute (aTTx, Bvblf, POdo). The
+# first crossing of the tail while the cell still climbs is no termination.
+TOP_RISE_MV = 10.0
+# ... and stay within TOP_CV_BAND_MV of its peak over the last TOP_PEAK_S. In
+# absorption the balancer pulled the highest cell 13 mV below its peak (Bvblf);
+# a charge that stops (a PV cloud, a charger that ends) falls with the current,
+# 50 mV and more within 20 s at C/7-C/5 (aTTx, POdo) and 33 mV in 3 min from a
+# C/300 tail (LCjx).
+TOP_CV_BAND_MV = 25.0
+TOP_PEAK_S = 600.0
+# Cut-off: the highest cell peaked at TOP_CUTOFF_MV or more within TOP_PEAK_S
+# before the current dropped. The van pack's cut-offs peaked at 3554-3600 mV
+# (minute maxima), the telemetry's at 3651-3671; a cut at 3.38 V (a BMS's
+# temperature or current protection) is no full.
+TOP_CUTOFF_MV = 3550.0
+# ... and between TOP_CUT_SETTLE_S and TOP_CUT_CHECK_S after it, with the
+# current still about 0, every cell at TOP_CELL_MIN_MV or more. Full cells stay
+# high (aTTx 3540-3550 mV, POdo 3496 mV a minute after the cut), cells that
+# were not full fall to the plateau (aTTx 3362 mV at 60 s, 3347 at 5 min).
+TOP_CUT_SETTLE_S = 60.0
+TOP_CUT_CHECK_S = 120.0
+# ... from a charge current of at most TOP_CUT_I_MAX_C x capacity. The
+# minute-after check stands on the cells relaxing: the higher the current
+# before the cut, the more polarisation a cell that is not full still carries
+# a minute later (aTTx: 3407 mV under C/7, 3362 a minute later; scaled to C/2
+# that is ~3.39 V, at the floor). The cut-offs seen came from C/20-C/7 (van:
+# 14-31 A on 280 Ah; POdo C/11; aTTx C/7).
+TOP_CUT_I_MAX_C = 0.25
+# The cell voltages used are at most this old; in a hold no two readings are
+# further apart. (They are fetched every VOLTAGE_PERIOD_S while charging.)
+TOP_VOLT_GAP_S = 60.0
+# A known cell temperature (a probe or pack_temp_estimator, never the MOSFET
+# alone: during and right after a charge it runs warm from the current) of at
+# least 15 degC: colder, the charge voltage at a given SoC is higher and 3400
+# mV comes early (the van at 10-12 degC: 16.2 % still to go at 3390-3400 mV,
+# 12-16 % on the cold morning at 3398-3412; at 15 degC and more at most 4.8 %,
+# see TOP_CELL_MIN_MV). 45 degC: the charge limit of LFP cell datasheets.
+TOP_TEMP_LO, TOP_TEMP_HI = 15.0, 45.0
+ANCHOR_KINDS = ('ocv', 'top')
 
 # ---------------------------------------------------------------- output
 # Published Qmax = median of the last SUMMARY_K accepted segments, once there
@@ -559,6 +745,22 @@ def charge_counter(charge, soc, capacity) -> Tuple[Optional[float], Optional[str
     return None, None
 
 
+def best_temperature(pack_temp, probes, mos) -> Tuple[Optional[float], bool]:
+    """The cell temperature an anchor is judged at [degC], None if none is
+    known -- never a default -- and whether it is the MOSFET's: the
+    pack-temperature estimate if it runs, else the median BMS probe, else the
+    MOSFET. The MOSFET is close to the cells at rest, which is when an OCV
+    anchor reads it; a top anchor comes during or right after a charge, when
+    the MOSFET runs warm from the current, so it refuses a MOSFET-only one.
+    Here and not in the sampler, so that the code fingerprint covers it."""
+    if finite(pack_temp):
+        return float(pack_temp), False
+    temps = sorted(t for t in (probes or []) if finite(t) and -40 < t < 100)
+    if temps:
+        return temps[len(temps) // 2], False
+    return (float(mos), True) if finite(mos) and -40 < mos < 100 else (None, False)
+
+
 def _counter_src_ok(src) -> bool:
     if src == 'charge':
         return True
@@ -569,6 +771,10 @@ def _counter_src_ok(src) -> bool:
     except ValueError:
         return False
     return math.isfinite(cap) and cap > 0
+
+
+def _fmt_ah(x: Optional[float]) -> str:
+    return 'not set' if x is None else '%g Ah' % x
 
 
 def _same_sign(dq: float, dsoc: Sequence[float]) -> bool:
@@ -595,13 +801,27 @@ class QmaxEstimator:
         self._last_c: Optional[float] = None  # the BMS's charge counter [Ah] at _last_t, None when unknown
         self._c_src: Optional[str] = None  # which counter (charge_counter); q_c belongs to it
         self.q_c: Optional[float] = None  # its resolution: the smallest non-zero step seen of THAT counter [Ah]
-        self._c_q: Optional[float] = None  # q_ah when that counter was last seen to move (None with q_c)
+        self._c_q: Optional[float] = None  # q_moved when that counter was last seen to move (None with q_c)
+        self._c_max: Optional[float] = None  # the highest plausible reading of THAT counter [Ah] (None with _c_src)
         self._last_soc: Optional[float] = None  # the BMS's SoC [%] at _last_t, None when unknown
+        self._last_soc_raw: Optional[float] = None  # ... as the driver reported it (BmsSample.soc_reported)
         self._last_cfull: Optional[float] = None  # the capacity the BMS reported at _last_t [Ah], None when unknown
+        self._last_aged: Optional[float] = None  # the aged (learnt full) capacity it reported [Ah], None when unknown
         self._resumed = False  # set by restore(): the next sample is the first after a restart
+        # A restart that continued the open segment, until the BMS's counter has
+        # been seen moving with the current again (_audit_step): {'t', 'c', 'src':
+        # the first sample after it and its counter reading, 'q', 'm': q_ah and
+        # q_moved there, 'held': times of the anchors whose pairs across it wait}
+        self._audit: Optional[Dict[str, Any]] = None
+        self._bms_caps: deque = deque(maxlen=BMS_CAP_N)  # [t, capacity the BMS reported], one an hour
+        self._cap_warned = False  # the mismatch was logged by this process
         self._t_glitch: Optional[float] = None  # the last impossible current reading
-        self._glitch_open = False  # one since the last good sample: the next must agree with that one
+        # An isolated impossible reading waiting for its neighbourhood (GLITCH_NB_N):
+        # {'before': [charge current of the good samples before it], 'after': [...]}
+        self._glitch_nb: Optional[Dict[str, List[float]]] = None
+        self._recent: deque = deque(maxlen=GLITCH_NB_N)  # the last good samples' charge currents
         self.q_ah = 0.0
+        self.q_moved = 0.0  # the charge moved either way, the integral of |I| [Ah]: what a stalled counter misses
         self.covered_s = 0.0
         self.epoch = 0  # bumped by every gap: anchors of different epochs never pair
         # rest detection
@@ -616,6 +836,7 @@ class QmaxEstimator:
         self._rest_n = 0
         self._load_ewma: Optional[float] = None  # mean charge current of recent load minutes, for the direction tag
         self._t_volt: Optional[float] = None
+        self._top_reset()  # charge termination (top anchor): what this charge has shown so far
         # results
         self.anchors = deque(maxlen=MAX_ANCHORS)
         self.segments = deque(maxlen=SUMMARY_K)
@@ -629,6 +850,15 @@ class QmaxEstimator:
         self.n_dropped = 0
         self._t_summary: Optional[float] = None
         self._announced = False
+        # What is out on MQTT: a published value stays in Home Assistant until
+        # its entity expires (a year), so one that may no longer go out must be
+        # withdrawn (take_withdrawal). Not saved: after a restart the first
+        # sample withdraws whatever is out unless the restored state still
+        # publishes (a corrected capacity option, changed code, a state that
+        # did not validate).
+        self._out = False  # a value from this process is out
+        self._started = False  # the first sample of this process came
+        self._withdraw: Optional[str] = None  # why what is out must be withdrawn, until taken
 
     # ------------------------------------------------------------ properties
 
@@ -640,49 +870,116 @@ class QmaxEstimator:
             return self.design_capacity, 'option'
         return None, None
 
+    def bms_capacity(self) -> Optional[float]:
+        """What the BMS reports as its capacity, the median of the last
+        BMS_CAP_N hourly readings, None when it reports none. A sanity check
+        of the option only (CAPACITY_MISMATCH_MAX)."""
+        return median([c for _, c in self._bms_caps]) if self._bms_caps else None
+
+    def capacity_mismatch(self) -> Optional[Tuple[float, float]]:
+        """(option, BMS capacity) when both are known and one is more than
+        CAPACITY_MISMATCH_MAX x the other, else None."""
+        cap, bms = self.design_capacity, self.bms_capacity()
+        if cap is None or bms is None or not max(cap, bms) > CAPACITY_MISMATCH_MAX * min(cap, bms):
+            return None
+        return cap, bms
+
+    def _warn_mismatch(self, what: str):
+        mm = self.capacity_mismatch()
+        assert mm is not None
+        logger.warning('%s: Qmax/SoH: %s: the capacity option is %g Ah and the BMS reports %g Ah. The option must be '
+                       'the nameplate of this one pack, not of a bank of packs; correct whichever is wrong',
+                       self.name, what, mm[0], mm[1])
+
     def rest_current(self) -> float:
         cap, _ = self.capacity()
         return min(REST_I_MAX_A, REST_C_RATE * cap) if cap else REST_I_MAX_A
 
+    def _counted(self) -> List[Dict[str, Any]]:
+        """The kept segments that may go into what is published, checked again
+        against the present configuration: measured against the present
+        capacity option, every cell's Qmax inside its plausibility window
+        now, and of the newest segment's cell count. A segment that fails
+        (one restored from before the option or the pack changed) is left
+        out, never published as if it belonged to this pack."""
+        if not self.segments:
+            return []
+        cap, _ = self.capacity()
+        n = len(self.segments[-1]['q_cells'])
+        return [s for s in self.segments if self._counts(s, cap, n)]
+
+    @staticmethod
+    def _counts(s, cap: Optional[float], n_cells: int) -> bool:
+        return s.get('cap') == cap and len(s['q_cells']) == n_cells \
+            and (cap is None or all(PLAUSIBLE_REL[0] * cap <= x <= PLAUSIBLE_REL[1] * cap for x in s['q_cells']))
+
     @property
     def value(self) -> Optional[float]:
-        """Median Qmax over the kept segments [Ah], or None with fewer than
-        PUBLISH_MIN_SEGMENTS."""
-        if len(self.segments) < PUBLISH_MIN_SEGMENTS:
+        """Median Qmax over the kept segments that count (_counted) [Ah], or
+        None with fewer than PUBLISH_MIN_SEGMENTS of them."""
+        segs = self._counted()
+        if len(segs) < PUBLISH_MIN_SEGMENTS:
             return None
-        return median([s['qmax'] for s in self.segments])
+        return median([s['qmax'] for s in segs])
 
     def result(self) -> Optional[Dict[str, Any]]:
         """What would be published now: Qmax, SoH (None without a capacity) and
-        the provenance of the newest segment."""
-        v = self.value
-        if v is None:
+        the provenance of the newest segment that counts."""
+        segs = self._counted()
+        if len(segs) < PUBLISH_MIN_SEGMENTS or self.capacity_mismatch() is not None:
             return None
+        v = median([s['qmax'] for s in segs])
         cap, src = self.capacity()
-        new = self.segments[-1]
+        new = segs[-1]
         return dict(qmax=v, soh=100.0 * v / cap if cap else None, capacity=cap, capacity_source=src,
-                    segments=len(self.segments), newest=fmt_t(new['t']), newest_t=new['t'],
+                    segments=len(segs), newest=fmt_t(new['t']), newest_t=new['t'],
                     limiting_cell=new['cell'] + 1, cell_spread_pct=round(100.0 * new['spread'], 1),
                     min_dsoc=round(min(abs(d) for d in new['dsoc']), 1),
                     offset_assumed_a=round(new['i_off'], 2), offset_drift_pct=round(100.0 * new['drift'], 1),
-                    plausibility_checked=new['cap'] is not None)
+                    plausibility_checked=new['cap'] is not None, anchors='->'.join(new['kinds']),
+                    top_anchored=sum('top' in s['kinds'] for s in segs))
 
     def wants_voltages(self, t: float, current: float) -> bool:
-        """Whether this iteration's cell voltages are worth a fetch: only near
-        rest (where anchors are made) and at most every VOLTAGE_PERIOD_S."""
-        if not self.enabled or not finite(current) or abs(current) > REST_ABS_FACTOR * self.rest_current():
+        """Whether this iteration's cell voltages are worth a fetch: near rest
+        (where OCV anchors are made), while charging (where a top anchor is:
+        with a capacity, which it needs) or a cut-off waits for its check, and
+        at most every VOLTAGE_PERIOD_S."""
+        if not self.enabled or not finite(current):
+            return False
+        rest = self.rest_current()
+        charging = self.design_capacity is not None and -current > rest
+        if abs(current) > REST_ABS_FACTOR * rest and not charging and self._top_cut is None:
             return False
         return self._t_volt is None or not (0 <= t - self._t_volt < VOLTAGE_PERIOD_S)
+
+    @locked
+    def take_withdrawal(self) -> Optional[str]:
+        """Why what was published must be withdrawn now, once, else None. The
+        caller clears the entities (mqtt_util.withdraw_qmax): an estimate that
+        would no longer be published -- the capacity option corrected (the
+        saved state is discarded), the BMS's capacity now disagreeing with it,
+        the estimator disabled, its segments dropped -- otherwise stayed in
+        Home Assistant until the entity expired a year later (rev8, finding
+        2)."""
+        why, self._withdraw = self._withdraw, None
+        return why
+
+    def _recheck_out(self, why: str):
+        """A value is out and nothing would be published now: withdraw it."""
+        if self._out and self.result() is None:
+            self._out, self._withdraw = False, why
 
     @locked
     def disable(self, reason: str, persistent: bool = True):
         if self.enabled:
             logger.warning('%s: Qmax/SoH estimator disabled: %s', self.name, reason)
+        self._out, self._withdraw = False, 'the estimator is disabled: ' + reason
         self.enabled = False
         self.disabled_reason = reason
         self._disable_persistent = persistent
         self._bin = None
         self._reset_rest()
+        self._top_reset()
         self.anchors.clear()
         self.segments.clear()
 
@@ -692,7 +989,8 @@ class QmaxEstimator:
     def add(self, t: float, current: float, voltages: Optional[Sequence[float]] = None,
             temp: Optional[float] = None, capacity: Optional[float] = None,
             bms_charge: Optional[float] = None, charge_src: Optional[str] = None,
-            bms_soc: Optional[float] = None) -> Optional[Dict[str, Any]]:
+            bms_soc: Optional[float] = None, bms_soc_raw: Optional[float] = None,
+            aged_capacity: Optional[float] = None, temp_mos: bool = False) -> Optional[Dict[str, Any]]:
         """Feed one sampler iteration.
 
         t: sample timestamp [s]; current [A], BmsSample sign (positive =
@@ -705,13 +1003,26 @@ class QmaxEstimator:
         None/NaN when unknown (only used as evidence across a restart, see the
         module doc), and charge_src which counter it is (charge_counter; None:
         'charge'); bms_soc [%]: the BMS's SoC, None/NaN when unknown (tells
-        whether that counter may be held at a stop).
+        whether that counter may be held at a stop); bms_soc_raw [%]: that SoC
+        as the driver reported it, before BmsSample replaced an integer one by
+        charge / capacity (BmsSample.soc_reported), None/NaN when unknown;
+        aged_capacity [Ah]: the BMS's aged or learnt full capacity
+        (BmsSample.aged_capacity), None/NaN when unknown. All three only tell
+        the stop rule where the counter's full end may be. temp_mos: temp is
+        the MOSFET's (best_temperature): good enough at rest, not for a top
+        anchor, which comes during or right after a charge.
 
         Returns result() when this call accepted a segment and at least
         PUBLISH_MIN_SEGMENTS are in, else None -- a caller that publishes the
         return value only ever publishes a fresh result."""
         if not self.enabled or not finite(t) or not finite(current):
             return None
+        if not self._started:
+            self._started = True
+            if self.result() is None:  # whatever an earlier run published may not stand
+                self._out, self._withdraw = False, 'nothing to publish at the start'
+            else:
+                self._out = True  # the restored estimate: an earlier run published it
         if self._last_t is not None and t == self._last_t:
             return None  # the BMS re-served the same measurement
         if self._last_t is not None and t < self._last_t:
@@ -727,47 +1038,74 @@ class QmaxEstimator:
             # ends the epoch now; the next good sample then integrates inside
             # the new epoch and before any of its anchors.
             self.counts['current_implausible'] += 1
-            burst = self._t_glitch is not None and 0 <= t - self._t_glitch <= GLITCH_ISOLATION_S
+            why = self._glitch_ends(t)
             self._t_glitch = t
-            self._glitch_open = not burst and self._last_t is not None
+            if why is not None:
+                self._glitch_nb = None
+            elif self._last_t is not None:
+                self._glitch_nb = dict(before=list(self._recent), after=[])
             logger.debug('%s: Qmax: current %.6g A at %s is not a measurement%s', self.name, current, fmt_t(t),
-                         ', the second within %.0f s: open segment invalidated' % GLITCH_ISOLATION_S if burst else
-                         ', left out and bridged')
-            return self._gap(t, 'current_implausible_burst') if burst else None
+                         ', left out and bridged' if why is None else
+                         ', the second within %.0f s: open segment invalidated' % GLITCH_ISOLATION_S
+                         if why == 'current_implausible_burst' else
+                         ', the second before the first one\'s neighbourhood was complete: open segment invalidated')
+            return None if why is None else self._gap(t, why)
 
         i = -float(current)  # charge current
         c = float(bms_charge) if finite(bms_charge) else None
         src = (charge_src or 'charge') if c is not None else None
         soc = float(bms_soc) if finite(bms_soc) else None
+        soc_raw = float(bms_soc_raw) if finite(bms_soc_raw) else None
         cfull = float(capacity) if finite(capacity) and capacity > 0 else None
+        aged = float(aged_capacity) if finite(aged_capacity) and aged_capacity > 0 else None
         new = None
+        resumed = False  # this sample continues the open segment across a restart
         if self._last_t is not None:
             dt = t - self._last_t
             if not 0 <= dt <= MAX_GAP_S:  # (dt < 0 cannot reach here: _clock_back reset _last_t)
                 new = self._gap(t, 'gap')
-            elif self._resumed and not self._resume_ok(t, i, dt, c, src, soc, cfull):
+            elif self._resumed and not self._resume_ok(t, i, dt, c, src, (soc, soc_raw, cfull, aged)):
                 new = self._gap(t, 'restart_unverified')
-            elif self._glitch_open and not self._neighbours_agree(i):
-                new = self._gap(t, 'current_implausible_neighbours')
             else:
+                resumed = self._resumed
                 assert self._last_i is not None
                 self.q_ah += 0.5 * (i + self._last_i) * dt / 3600.0
+                self.q_moved += self._moved(self._last_i, i, dt)
                 if dt <= COVERED_DT_S:
                     self.covered_s += dt
-        self._resumed = self._glitch_open = False
+        self._resumed = False
+        if self._glitch_nb is not None:  # (a gap or a refused restart above cleared it)
+            self._glitch_nb['after'].append(i)
+            if len(self._glitch_nb['after']) >= GLITCH_NB_N:
+                nb, self._glitch_nb = self._glitch_nb, None
+                if not self._neighbourhood_ok(nb['before'], nb['after']):
+                    new = self._gap(t, 'current_implausible_neighbours') or new
+        self._recent.append(i)
         if c is not None and src != self._c_src:
             # Another counter (the BMS reported its remaining charge only now or
             # no longer, or scales its SoC by another capacity): the smallest
             # step of the old one says nothing about this one's resolution.
-            self._c_src, self.q_c, self._c_q, self._last_c = src, None, None, None
+            self._c_src, self.q_c, self._c_q, self._last_c, self._c_max = src, None, None, None, None
         if c is not None and self._last_c is not None:
             step = abs(c - self._last_c)
             if step > 1e-9 * max(1.0, abs(c)):
-                self._c_q = self.q_ah  # it moved: what it reads now includes the charge counted up to here
+                self._c_q = self.q_moved  # it moved: what it reads now includes the charge up to here
                 if self.q_c is None or step < self.q_c:
                     self.q_c = step
+        if c is not None and self._counter_plausible(c):
+            self._c_max = c if self._c_max is None else max(self._c_max, c)
         self._last_t, self._last_i, self._last_c = t, i, c
-        self._last_soc, self._last_cfull = soc, cfull
+        self._last_soc, self._last_soc_raw, self._last_cfull, self._last_aged = soc, soc_raw, cfull, aged
+        if resumed:
+            self._start_audit(t, c, src)
+        elif self._audit is not None:
+            new = self._audit_step(t, c, src) or new
+        if cfull is not None and (not self._bms_caps or not 0 <= t - self._bms_caps[-1][0] < BMS_CAP_PERIOD_S):
+            self._bms_caps.append([t, cfull])
+            if not self._cap_warned and self.capacity_mismatch() is not None:
+                self._cap_warned = True
+                self._warn_mismatch('nothing will be published')
+            self._recheck_out('the capacity option and the capacity the BMS reports disagree')
 
         if self._t_summary is None:
             self._t_summary = t
@@ -794,6 +1132,7 @@ class QmaxEstimator:
                     vt = None  # the current still counts, the voltages do not
             else:
                 vt = None
+        new = self._top_step(t, i, vt, bool(voltages) and vt is None, None if temp_mos else temp, temp_mos) or new
 
         idx = math.floor(t / REST_BIN_S)
         if self._bin is not None and self._bin['idx'] != idx:
@@ -816,34 +1155,252 @@ class QmaxEstimator:
             b['temp'].append(float(temp))
         return new
 
-    def _neighbours_agree(self, i: float) -> bool:
-        """The good samples either side of an isolated impossible reading: i
-        now, _last_i before it (charge currents). Do they agree well enough
-        to bridge the hole between them (GLITCH_AGREE_*)?"""
-        assert self._last_i is not None
-        tol = max(GLITCH_AGREE_A, GLITCH_AGREE_REL * max(abs(i), abs(self._last_i)))
-        if abs(i - self._last_i) <= tol:
-            return True
-        logger.debug('%s: Qmax: %.1f A before an impossible current reading and %.1f A after it disagree: open '
-                     'segment invalidated', self.name, -self._last_i, -i)
-        return False
+    # ------------------------------------------------------------ top anchor
 
-    def _counter_stop(self, c: float, soc: Optional[float], cfull: Optional[float], when: str) -> Optional[str]:
-        """Why the counter reading c may be held at a stop, or None. A reading
-        without a SoC cannot be told from one at a stop."""
-        if soc is None:
-            return 'the BMS reported no SoC %s it, so a counter held at full or empty cannot be ruled out' % when
-        if soc >= 100.0 - COUNTER_STOP_PCT or soc <= COUNTER_STOP_PCT:
-            return 'the BMS read SoC %.1f %% %s it: a counter at full or empty does not count what still flows' \
-                % (soc, when)
-        assert self.q_c is not None
-        if c <= self.q_c or (cfull is not None and c >= cfull - self.q_c):
-            return 'the counter read %.2f Ah %s it, at its %s' % (c, when, 'empty end' if c <= self.q_c else
-                                                                   'full end (%.1f Ah)' % cfull)
+    def _top_reset(self):
+        """Forget the charge in progress (a gap, a clock step, a disable)."""
+        self._top_bulk: Optional[float] = None  # the end of the last minute of a sustained bulk
+        self._top_bulk_i: Optional[float] = None  # ... and its level: the highest current held that long [A]
+        self._top_min: Optional[list] = None  # the minute in progress: [index, sum of charge currents, samples]
+        self._top_run: deque = deque()  # the last minutes in a row: (index, mean charge current)
+        self._top_peak: deque = deque()  # (t, highest cell), decreasing: the max over the last TOP_PEAK_S
+        self._top_v: Optional[Tuple[float, float, float, int]] = None  # last reading: t, highest, lowest, cells
+        self._top_hold: Optional[Dict[str, Any]] = None  # a tail termination in progress
+        self._top_cut: Optional[Dict[str, Any]] = None  # a cut-off waiting for its check
+        self._top_prev: Optional[Tuple[float, float]] = None  # the last sample: t, charge current
+        self._top_done: Optional[float] = None  # the last top anchor: one per bulk phase
+
+    def _top_minute(self, t: float, i: float, cap: float):
+        """Minute means of the charge current. A bulk is TOP_BULK_SUSTAIN_S of
+        minutes in a row, each at TOP_BULK_C x capacity or more (a spike is
+        none); its level is the highest current held that long (the largest
+        5-minute minimum within TOP_BULK_S), which the tail must fall to
+        TOP_TAPER of."""
+        idx = math.floor(t / 60.0)
+        m = self._top_min
+        if m is not None and m[0] != idx:
+            run = self._top_run
+            if run and run[-1][0] != m[0] - 1:
+                run.clear()  # a minute without samples breaks the run
+            run.append((m[0], m[1] / m[2]))
+            n = max(1, int(round(TOP_BULK_SUSTAIN_S / 60.0)))
+            while len(run) > n:
+                run.popleft()
+            level = min(x for _, x in run)
+            if len(run) == n and level >= TOP_BULK_C * cap:
+                end = 60.0 * (m[0] + 1)
+                recent = self._top_bulk is not None and end - self._top_bulk <= TOP_BULK_S
+                self._top_bulk = end
+                self._top_bulk_i = max(level, self._top_bulk_i) if recent and self._top_bulk_i else level
+            m = None
+        if m is None:
+            m = self._top_min = [idx, 0.0, 0]
+        m[1] += i
+        m[2] += 1
+
+    def _top_step(self, t: float, i: float, vt: Optional[List[Optional[float]]], dropped: bool,
+                  temp: Optional[float], temp_mos: bool = False) -> Optional[Dict[str, Any]]:
+        """One sample of the charge-termination detector (TOP_* constants):
+        charge current i [A], cell voltages vt (None: not fetched, or dropped
+        by the chemistry guard -- dropped True)."""
+        cap = self.design_capacity
+        if cap is None:
+            return None  # the tail and the bulk are fractions of it: nothing is evaluable
+        tail, rest = TOP_TAIL_C * cap, self.rest_current()
+        self._top_minute(t, i, cap)
+        if vt is not None and all(v is not None for v in vt):
+            hi, lo = max(vt), min(vt)
+            pk = self._top_peak
+            while pk and pk[-1][1] <= hi:
+                pk.pop()
+            pk.append((t, hi))
+            self._top_v = (t, hi, lo, len(vt))
+        elif vt is not None or dropped:
+            self._top_v = None  # a cell missing, or out of band: no reading to stand on
+        while self._top_peak and self._top_peak[0][0] < t - TOP_PEAK_S:
+            self._top_peak.popleft()
+        prev, self._top_prev = self._top_prev, (t, i)
+        v = self._top_v if self._top_v is not None and t - self._top_v[0] <= TOP_VOLT_GAP_S else None
+        peak = self._top_peak[0][1] if self._top_peak else None
+        bulk = self._top_bulk is not None and t - self._top_bulk <= TOP_BULK_S \
+            and (self._top_done is None or self._top_bulk > self._top_done)
+
+        c = self._top_cut
+        if c is not None:
+            if not -tail <= i <= rest:
+                self._top_cut = None
+                self._top_refuse('top_cut_resumed', c['t'], 'the current came back (%.1f A)' % -i)
+            elif t - c['t'] > TOP_CUT_CHECK_S:
+                self._top_cut = None
+                self._top_refuse('top_cut_unverified', c['t'], 'no cell voltages %.0f-%.0f s after it'
+                                 % (TOP_CUT_SETTLE_S, TOP_CUT_CHECK_S))
+            elif v is not None and v[0] == t and t - c['t'] >= TOP_CUT_SETTLE_S and self._glitch_nb is None:
+                self._top_cut = None
+                if v[3] != c['n']:
+                    self._top_refuse('top_cells', c['t'], 'the cell count changed')
+                elif v[2] < TOP_CELL_MIN_MV:
+                    self._top_refuse('top_cut_not_full', c['t'], 'a cell at %.0f mV %.0f s after it'
+                                     % (v[2], t - c['t']))
+                else:
+                    return self._top_anchor(c, 'cutoff', t, [v[2], v[1]])
+            return None
+        if prev is not None and prev[1] > tail and -tail <= i <= rest and t - prev[0] <= COVERED_DT_S:
+            self._top_hold = None
+            if not bulk:
+                return None  # (the charge before it was no bulk, or it already made its anchor)
+            if prev[1] > TOP_CUT_I_MAX_C * cap:
+                self._top_refuse('top_cut_current', t, 'cut from %.1f A, above C/%.0f' % (prev[1], 1 / TOP_CUT_I_MAX_C))
+                return None
+            if peak is None or peak < TOP_CUTOFF_MV or self._top_v is None or self._top_v[0] < prev[0] - TOP_VOLT_GAP_S:
+                # (no verdict on the charge: a cloud or a load switch reads the same; the tail may still come)
+                self._top_refuse('top_cut_low', t, 'the highest cell peaked at %s'
+                                 % ('%.0f mV' % peak if peak is not None else 'an unknown voltage'))
+                return None
+            self._top_cut = dict(t=t, t0=t, q=self.q_ah, cov=self.covered_s, epoch=self.epoch, n=self._top_v[3],
+                                 temps=[temp] if finite(temp) else [], mos=temp_mos)
+            return None
+
+        h = self._top_hold
+        taper = TOP_TAPER * self._top_bulk_i if bulk and self._top_bulk_i is not None else -math.inf
+        if not (-rest <= i <= min(tail, taper) and bulk and v is not None and peak is not None and v[2] >= TOP_CELL_MIN_MV
+                and v[1] >= peak - TOP_CV_BAND_MV):
+            self._top_hold = None
+            return None
+        if h is None or v[3] != h['n'] or v[1] > h['v0'] + TOP_RISE_MV:
+            h = self._top_hold = dict(t0=v[0], v0=v[1], n=v[3], k=0, temps=[], mos=False)  # (re)starts at this reading
+        if v[0] == t:
+            h['k'] += 1
+        if finite(temp):
+            h['temps'].append(float(temp))
+        h['mos'] = h['mos'] or temp_mos
+        if t - h['t0'] < TOP_HOLD_S or h['k'] < TOP_HOLD_READINGS or self._glitch_nb is not None:
+            return None
+        self._top_hold = None
+        return self._top_anchor(dict(t=t, t0=h['t0'], q=self.q_ah, cov=self.covered_s, epoch=self.epoch,
+                                     n=h['n'], temps=h['temps'], mos=h['mos']), 'tail', t, [v[2], v[1]])
+
+    def _top_refuse(self, why: str, t: float, detail: str):
+        self.counts[why] += 1
+        # a low "cut" is any load switch or cloud after a bulk phase: several a day, in the daily summary only
+        logger.log(logging.DEBUG if why == 'top_cut_low' else logging.INFO,
+                   '%s: Qmax: charge end at %s is no top anchor: %s', self.name, fmt_t(t), detail)
+
+    def _top_anchor(self, c: Dict[str, Any], mode: str, now: float, lo_hi) -> Optional[Dict[str, Any]]:
+        """A termination passed: every cell at SoC 100 %, as an anchor that
+        pairs like an OCV one (_pair), never with another top anchor."""
+        self._top_done = now
+        temp = median(c['temps']) if c['temps'] else None
+        if temp is None:
+            if c['mos']:
+                self._top_refuse('top_temp_mos', c['t'], 'only the MOSFET temperature is known, and while charging '
+                                 'it is not the cells\' (set up pack_temp_estimator or a probe)')
+            else:
+                self._top_refuse('top_temp_missing', c['t'], 'no temperature known')
+            return None
+        if not TOP_TEMP_LO <= temp <= TOP_TEMP_HI:
+            self._top_refuse('top_temp_range', c['t'], '%.1f degC is outside %.0f..%.0f degC'
+                             % (temp, TOP_TEMP_LO, TOP_TEMP_HI))
+            return None
+        if not TOP_ANCHORS:
+            return None
+        n = c['n']
+        a = dict(t=c['t'], t0=c['t0'], q=c['q'], cov=c['cov'], epoch=c['epoch'], temp=temp, dir='chg', i_rest=0.0,
+                 ocv=[None] * n, soc=[100.0] * n, why=[None] * n, fit=[None] * n, cap=self.design_capacity,
+                 kind='top', mode=mode)
+        logger.info('%s: Qmax top anchor (%s): charge end at %s, %.1f degC, cells %.0f..%.0f mV -> SoC 100 %%',
+                    self.name, mode, fmt_t(c['t']), temp, lo_hi[0], lo_hi[1])
+        self.counts['anchor_top'] += 1
+        return self._pair(a, now)
+
+    def _glitch_ends(self, t: float) -> Optional[str]:
+        """Does an impossible reading at t end the epoch, and why: a second
+        one within GLITCH_ISOLATION_S of the last (a burst), or one that comes
+        while an earlier one still waits for its GLITCH_NB_N samples after it.
+        That window then holds an impossible reading, so it cannot be the clean
+        neighbourhood the first one needs; judging both holes by the first
+        one's decision closed it one good sample after the second (rev8: with
+        samples 80 s apart the second came more than GLITCH_ISOLATION_S
+        later, and 4 / 8 garbled 450 A frames after it published 102.4 / 107.3
+        Ah for 97.5). None: an isolated one, bridged if its neighbourhood
+        agrees."""
+        if self._t_glitch is not None and 0 <= t - self._t_glitch <= GLITCH_ISOLATION_S:
+            return 'current_implausible_burst'
+        if self._glitch_nb is not None:
+            return 'current_implausible_neighbours'
         return None
 
+    def add_sample(self, sample, current: float, voltages: Optional[Sequence[float]],
+                   temp: Optional[float], temp_mos: bool = False) -> Optional[Dict[str, Any]]:
+        """add() for a BmsSample: which of its fields go where. current: the
+        native (pre invert_current) current; temp: best_temperature(). Here
+        and not in the sampler, so that the code fingerprint covers it."""
+        counter, counter_src = charge_counter(sample.charge, sample.soc, sample.capacity)
+        return self.add(sample.timestamp, current, voltages or None, temp=temp, capacity=sample.capacity,
+                        bms_charge=counter, charge_src=counter_src, bms_soc=sample.soc,
+                        bms_soc_raw=getattr(sample, 'soc_reported', None), aged_capacity=sample.aged_capacity,
+                        temp_mos=temp_mos)
+
+    def _neighbourhood_ok(self, before: Sequence[float], after: Sequence[float]) -> bool:
+        """The good samples either side of an isolated impossible reading
+        (charge currents): GLITCH_NB_N of each, all within the tolerance of
+        their median (GLITCH_AGREE_*)? Then the hole is bridged; fewer is
+        unevaluable, never agreement."""
+        vals = list(before) + list(after)
+        if len(before) < GLITCH_NB_N or len(after) < GLITCH_NB_N:
+            why = 'only %d good samples before it' % len(before)
+        else:
+            m = median(vals)
+            tol = max(GLITCH_AGREE_A, GLITCH_AGREE_REL * abs(m))
+            if all(abs(v - m) <= tol for v in vals):
+                return True
+            why = 'they do not agree within %.1f A of %.1f A' % (tol, -m)
+        logger.debug('%s: Qmax: the samples around an impossible current reading [%s] A: %s, open segment '
+                     'invalidated', self.name, ', '.join('%.1f' % -v for v in vals), why)
+        return False
+
+    def _counter_plausible(self, c: float) -> bool:
+        """A counter reading the pack can hold: not negative, and at most
+        PLAUSIBLE_REL[1] x the capacity when one is known. Only such readings
+        teach the counter's highest reading (_c_max): one garbled reading
+        above it would otherwise hide the counter's real full end for good."""
+        cap, _ = self.capacity()
+        return c >= 0.0 and (cap is None or c <= PLAUSIBLE_REL[1] * cap)
+
+    def _counter_stop(self, c: float, ends: Tuple[Optional[float], ...], c_max: Optional[float],
+                      when: str) -> Optional[str]:
+        """Why the counter reading c may be held at a stop, or None. ends:
+        (SoC, SoC as the driver reported it, capacity the BMS reports, aged
+        capacity it reports), each None when unknown; c_max: the highest
+        plausible reading of this counter, c included. Every one that says
+        "at a stop" counts (module doc), and a reading without any SoC, or
+        whose highest reading is unknown, cannot be told from one at a stop."""
+        soc, soc_raw, cfull, aged = ends
+        socs = [s for s in (soc, soc_raw) if s is not None]
+        if not socs:
+            return 'the BMS reported no SoC %s it, so a counter held at full or empty cannot be ruled out' % when
+        for s in socs:
+            if not COUNTER_STOP_PCT < s < 100.0 - COUNTER_STOP_PCT:
+                return 'the BMS read SoC %.1f %% %s it: a counter at full or empty does not count what still flows' \
+                    % (s, when)
+        assert self.q_c is not None
+        if c <= self.q_c:
+            return 'the counter read %.2f Ah %s it, at its empty end' % (c, when)
+        if c_max is None or not self._counter_plausible(c):
+            return 'the counter read %.2f Ah %s it, more than the pack can hold, so its full end is not known' \
+                % (c, when)
+        for what, full in (('the capacity the BMS reports', cfull), ('the aged capacity the BMS reports', aged),
+                           ('the highest reading of this counter', c_max)):
+            if full is not None and c >= full - self.q_c:
+                return 'the counter read %.2f Ah %s it, at its full end: %s, %.2f Ah' % (c, when, what, full)
+        return None
+
+    @staticmethod
+    def _moved(i0: float, i1: float, dt: float) -> float:
+        """Charge moved either way over one interval [Ah] (trapezoid of |I|)."""
+        return 0.5 * (abs(i0) + abs(i1)) * dt / 3600.0
+
     def _resume_ok(self, t: float, i: float, dt: float, c: Optional[float], src: Optional[str],
-                   soc: Optional[float], cfull: Optional[float]) -> bool:
+                   ends: Tuple[Optional[float], ...]) -> bool:
         """First sample after a restart, dt after the last one saved: may the
         open segment go on? Only on evidence that the charge the linear bridge
         counts is the charge that moved, from the BMS's own counter (see the
@@ -851,7 +1408,9 @@ class QmaxEstimator:
         cap, _ = self.capacity()
         assert self._last_i is not None
         bridge = 0.5 * (i + self._last_i) * dt / 3600.0
-        if c is None or self._last_c is None:
+        if self._audit is not None:
+            why = "the BMS's counter has not been seen moving with the current since the restart before"
+        elif c is None or self._last_c is None:
             why = 'the BMS reports no remaining charge to check it against'
         elif src != self._c_src:
             why = 'the charge counter is another one than before (%s, was %s)' % (src, self._c_src)
@@ -861,25 +1420,80 @@ class QmaxEstimator:
             why = 'no capacity is known'
         else:
             assert self._c_q is not None  # set with q_c
-            why = self._counter_stop(self._last_c, self._last_soc, self._last_cfull, 'before') \
-                or self._counter_stop(c, soc, cfull, 'after')
+            c_max = self._c_max if self._c_max is not None and self._c_max >= self._last_c else None
+            c_max_after = max(c, self._c_max) if self._c_max is not None else c
+            why = self._counter_stop(self._last_c, (self._last_soc, self._last_soc_raw, self._last_cfull,
+                                                    self._last_aged), c_max, 'before') \
+                or self._counter_stop(c, ends, c_max_after, 'after')
         if why is None:
             assert c is not None and self._last_c is not None and self.q_c is not None and self._c_q is not None
             moved = c - self._last_c
-            # Its last reading may lag what was counted since it last moved (a
-            # cached reading, or a counter that stopped): that counts as missed.
-            stale = abs(self.q_ah - self._c_q)
+            # Its last reading may lag what moved since it last moved (a cached
+            # reading, or a counter that stopped): that counts as missed. The
+            # charge moved either way, not the net: +-22 A that nets to zero
+            # while the counter stood still is 22 A of charge it did not see.
+            stale = abs(self.q_moved - self._c_q)
             miss = abs(moved - bridge) + self.q_c + stale
             if miss <= RESUME_TOL_FRAC * cap:
                 logger.info('%s: Qmax: restart after %.0f s, open segment continued: the BMS counted %+.2f Ah, the '
-                            'bridge %+.2f Ah (resolution %.2f Ah, %.2f Ah counted since it last moved)', self.name,
+                            'bridge %+.2f Ah (resolution %.2f Ah, %.2f Ah moved since it last moved)', self.name,
                             dt, moved, bridge, self.q_c, stale)
                 return True
-            why = 'the BMS counted %+.2f Ah, the bridge %+.2f Ah (resolution %.2f Ah, %.2f Ah counted since it last ' \
+            why = 'the BMS counted %+.2f Ah, the bridge %+.2f Ah (resolution %.2f Ah, %.2f Ah moved since it last ' \
                   'moved): %.2f Ah unaccounted for, more than %.0f %% of %.0f Ah' \
                   % (moved, bridge, self.q_c, stale, miss, 100 * RESUME_TOL_FRAC, cap)
         logger.info('%s: Qmax: restart after %.0f s by the clock, open segment ended: %s', self.name, dt, why)
         return False
+
+    def _start_audit(self, t: float, c: Optional[float], src: Optional[str]):
+        """A restart continued the open segment on the counter's word, which
+        cannot tell a counter that stopped shortly before the shutdown (and
+        still reads the same) from one at rest (module doc). Hold every pair
+        across it back until the counter is seen moving with the current."""
+        assert c is not None
+        self._audit = dict(t=t, c=c, src=src, q=self.q_ah, m=self.q_moved, held=[])
+
+    def _audit_step(self, t: float, c: Optional[float], src: Optional[str]) -> Optional[Dict[str, Any]]:
+        """After a continued restart: the counter, compared with the charge
+        counted since, either moves with it (by at least two of its steps, in
+        the same direction, within the restart's tolerance: the pairs held
+        back are released) or does not -- it stays put while more than the
+        tolerance moves, or it disagrees by more (a stopped counter that came
+        back with what it had missed). Then the restart's evidence was
+        worthless: the epoch ends there and the held pairs are dropped."""
+        a = self._audit
+        assert a is not None
+        cap, _ = self.capacity()
+        if not cap or self.q_c is None or self._c_q is None or (c is not None and src != a['src']):
+            return self._audit_fail(t, 'the counter it was checked with is gone')
+        tol = RESUME_TOL_FRAC * cap + self.q_c
+        stale = self.q_moved - self._c_q
+        if stale > tol:
+            return self._audit_fail(t, 'the BMS counter has not moved while %.2f Ah did' % stale)
+        if c is None:
+            return None
+        d_bms, d_q = c - a['c'], self.q_ah - a['q']
+        if abs(d_bms - d_q) > tol:
+            return self._audit_fail(t, 'the BMS counted %+.2f Ah since it, batmon %+.2f Ah' % (d_bms, d_q))
+        if abs(d_bms) >= 2 * self.q_c and d_bms * d_q > 0:
+            logger.info('%s: Qmax: the BMS counter moves with the current again (%+.2f Ah, counted %+.2f Ah) since '
+                        'the restart at %s: %d anchor(s) held back may pair across it', self.name, d_bms, d_q,
+                        fmt_t(a['t']), len(a['held']))
+            self._audit = None
+            new = None
+            for bt in a['held']:
+                b = next((x for x in self.anchors if x['t'] == bt), None)
+                if b is not None:
+                    new = self._pair_new(b, t, [x for x in self.anchors if x['t'] < bt]) or new
+            return new
+        return None
+
+    def _audit_fail(self, t: float, why: str) -> Optional[Dict[str, Any]]:
+        a = self._audit
+        assert a is not None
+        logger.info('%s: Qmax: the restart at %s continued the open segment, but %s: segment ended, %d anchor(s) '
+                    'held back not paired across it', self.name, fmt_t(a['t']), why, len(a['held']))
+        return self._gap(t, 'restart_audit')  # (pairs across it stay held while it closes the open rest)
 
     def _gap(self, t, why) -> Optional[Dict[str, Any]]:
         """The current record broke at t: close what was measured before it (a
@@ -891,7 +1505,8 @@ class QmaxEstimator:
             new = self._close_bin(t)
         new = self._end_rest(t) or new
         self.epoch += 1
-        self._resumed = self._glitch_open = False
+        self._resumed, self._glitch_nb, self._audit = False, None, None
+        self._top_reset()
         self.counts[why] += 1
         if why != 'current_implausible_burst':
             logger.debug('%s: Qmax: %s of %.0f s in the current record, open segment invalidated',
@@ -922,15 +1537,20 @@ class QmaxEstimator:
             self._oob_since = t
         if self._t_glitch is not None and self._t_glitch > t:
             self._t_glitch = None
-        self._glitch_open = False
+        self._glitch_nb = self._audit = None
+        self._top_reset()
+        self._recent.clear()  # timed on the other clock
+        self._bms_caps = deque((x for x in self._bms_caps if x[0] <= t), maxlen=BMS_CAP_N)
         self._t_volt = None
         self._last_t = self._last_i = self._last_c = self._last_soc = self._last_cfull = None
+        self._last_soc_raw = self._last_aged = None
         self._resumed = False
         self.epoch += 1
         self.counts['clock_back'] += 1
         logger.info('%s: Qmax: the clock stepped back by %.0f s (now %s): open segment, open rest, %d anchor(s) and '
                     '%d segment(s) timed after it dropped', self.name, back, fmt_t(t),
                     n_a - len(self.anchors), n_s - len(self.segments))
+        self._recheck_out('the clock stepped back and the segments timed after it were dropped')
 
     def _close_bin(self, now: float) -> Optional[Dict[str, Any]]:
         b = self._bin
@@ -1020,7 +1640,7 @@ class QmaxEstimator:
         cap, _ = self.capacity()
         a = dict(t=t1, t0=self._rest_t0, q=self._rest_q, cov=self._rest_cov, epoch=self.epoch, temp=temp,
                  dir=self._rest_dir, i_rest=self._rest_si / self._rest_n, ocv=ocv, soc=soc, why=why, fit=fit,
-                 cap=cap)
+                 cap=cap, kind='ocv')
         logger.info('%s: Qmax anchor: %.1f h rest ending %s, %.1f degC, OCV [%s] mV -> SoC [%s]', self.name,
                     dur / 3600, fmt_t(t1), temp, ', '.join('%.0f' % o if o is not None else '-' for o in ocv),
                     ', '.join('%.1f' % s if s is not None else str(w) for s, w in zip(soc, why)))
@@ -1048,8 +1668,9 @@ class QmaxEstimator:
             while self.anchors[0]['t'] < b['t'] - MAX_SEGMENT_S:
                 self.anchors.popleft()  # too old to pair with anything to come
 
-    def _pair_new(self, b, now: float) -> Optional[Dict[str, Any]]:
-        cands = list(self.anchors)[:-1]
+    def _pair_new(self, b, now: float, cands=None) -> Optional[Dict[str, Any]]:
+        if cands is None:
+            cands = list(self.anchors)[:-1]
         reason = 'no_prior_anchor'
         for a in reversed(cands):
             if a['epoch'] != b['epoch']:
@@ -1061,11 +1682,19 @@ class QmaxEstimator:
             if self._last_seg_t is not None and a['t'] < self._last_seg_t:
                 reason = 'overlap'
                 break
+            if a['kind'] == b['kind'] == 'top':
+                reason = 'top_top'  # two terminations say nothing about the charge between them
+                continue
+            if self._audit is not None and a['t'] < self._audit['t'] <= b['t']:
+                reason = 'restart_held'  # across a restart the counter has not confirmed yet (_audit_step)
+                if b['t'] not in self._audit['held']:
+                    self._audit['held'].append(b['t'])
+                break
             seg, reason = self._evaluate(a, b)
             self.pair_reasons[reason or 'accepted'] += 1
             if seg is not None:
                 return self._accept(seg, now)
-        if reason in ('gap', 'span', 'overlap', 'no_prior_anchor'):
+        if reason in ('gap', 'span', 'overlap', 'no_prior_anchor', 'restart_held', 'top_top'):
             self.pair_reasons[reason] += 1
         self.counts['anchor_unpaired'] += 1
         return None
@@ -1104,7 +1733,7 @@ class QmaxEstimator:
         med = median(qc)
         return dict(t=b['t'], t0=a['t'], dq=dq, dsoc=dsoc, q_cells=qc, qmax=qc[k], cell=k,
                     spread=(max(qc) - min(qc)) / med, cov=cov, temp0=a['temp'], temp1=b['temp'], cap=cap,
-                    i_off=i_off, drift=drift), None
+                    i_off=i_off, drift=drift, kinds=[a['kind'], b['kind']]), None
 
     def _accept(self, seg, now: float) -> Optional[Dict[str, Any]]:
         """Keep a segment and return what to publish. Ages count from now, the
@@ -1126,15 +1755,22 @@ class QmaxEstimator:
         if not all(segment_age_ok(now - s['t']) for s in self.segments):
             self.segments = deque((s for s in self.segments if segment_age_ok(now - s['t'])), maxlen=SUMMARY_K)
         if seg is None:
+            self._recheck_out('the segments it was made of are too old')
             return None
         self.counts['segment'] += 1
-        logger.info('%s: Qmax segment %s -> %s: dQ %+.1f Ah, dSoC [%s] %%, Qmax [%s] Ah, limiting cell %d, '
+        logger.info('%s: Qmax segment %s -> %s (%s): dQ %+.1f Ah, dSoC [%s] %%, Qmax [%s] Ah, limiting cell %d, '
                     'spread %.1f %%, coverage %.3f, offset drift %.1f %% at an assumed %.2f A', self.name,
                     fmt_t(seg['t0']),
-                    fmt_t(seg['t']), seg['dq'], ', '.join('%+.1f' % d for d in seg['dsoc']),
+                    fmt_t(seg['t']), '->'.join(seg['kinds']), seg['dq'], ', '.join('%+.1f' % d for d in seg['dsoc']),
                     ', '.join('%.1f' % q for q in seg['q_cells']), seg['cell'] + 1, 100 * seg['spread'], seg['cov'],
                     100 * seg['drift'], seg['i_off'])
         res = self.result()
+        if res is None:
+            self._recheck_out('nothing would be published now')
+        else:
+            self._out, self._withdraw = True, None
+        if res is None and self.capacity_mismatch() is not None and len(self._counted()) >= PUBLISH_MIN_SEGMENTS:
+            self._warn_mismatch('estimate not published')
         if res is not None and not self._announced:
             self._announced = True
             logger.info('%s: first Qmax estimate %.1f Ah%s (from %d segments)', self.name, res['qmax'],
@@ -1151,7 +1787,7 @@ class QmaxEstimator:
                         ('; %d samples dropped with a cell outside %.0f..%.0f mV'
                          % (self.n_dropped, LFP_MV_LO, LFP_MV_HI)) if self.n_dropped else '',
                         ('%.1f Ah' % v) if v is not None else
-                        'none yet (%d/%d segments)' % (len(self.segments), PUBLISH_MIN_SEGMENTS))
+                        'none yet (%d/%d segments)' % (len(self._counted()), PUBLISH_MIN_SEGMENTS))
         self.counts.clear()
         self.pair_reasons.clear()
         self.n_dropped = 0
@@ -1167,12 +1803,15 @@ class QmaxEstimator:
         rest in progress then restarts after a crash. full=True (at shutdown)
         is everything."""
         st: Dict[str, Any] = dict(
-            version=STATE_VERSION, code=CODE_FINGERPRINT,
+            version=STATE_VERSION, code=CODE_FINGERPRINT, capacity=self.design_capacity,
             disabled_reason=self.disabled_reason if (not self.enabled and self._disable_persistent) else None,
             last_t=self._last_t, last_i=self._last_i, last_charge=self._last_c, charge_src=self._c_src,
-            q_charge=self.q_c, charge_q=self._c_q, last_soc=self._last_soc, last_charge_full=self._last_cfull,
-            t_glitch=self._t_glitch, glitch_open=self._glitch_open,
-            q_ah=self.q_ah, covered_s=self.covered_s, epoch=self.epoch,
+            q_charge=self.q_c, charge_q=self._c_q, charge_max=self._c_max, last_soc=self._last_soc,
+            last_soc_raw=self._last_soc_raw, last_charge_full=self._last_cfull, last_aged=self._last_aged,
+            t_glitch=self._t_glitch, glitch_nb=copy.deepcopy(self._glitch_nb), recent=list(self._recent),
+            audit=copy.deepcopy(self._audit),
+            bms_caps=[list(x) for x in self._bms_caps],
+            q_ah=self.q_ah, q_moved=self.q_moved, covered_s=self.covered_s, epoch=self.epoch,
             anchors=[dict(a) for a in self.anchors], segments=[dict(s) for s in self.segments],
             last_seg_t=self._last_seg_t, load_ewma=self._load_ewma,
             announced=self._announced,
@@ -1212,10 +1851,22 @@ class QmaxEstimator:
             logger.info('%s: Qmax/SoH estimator code changed since the state was saved: anchors, segments and the '
                         'open coulomb count discarded', self.name)
             return
+        saved_cap = v_opt_fin(st.get('capacity'), 'capacity')
+        if saved_cap != self.design_capacity:
+            # The option was corrected or the pack replaced: what was measured
+            # and checked against the old option says nothing about this one
+            # (a 100 Ah pack's segments, divided by a new 280, went out as SoH
+            # 34.8 % with the plausibility check passed). Nor does the open
+            # count, the counter or the chemistry verdict of another pack.
+            logger.warning('%s: Qmax/SoH: the capacity option is %s, the saved state was measured against %s: a '
+                           'corrected option or another pack, so anchors, segments and the open coulomb count are '
+                           'discarded', self.name, _fmt_ah(self.design_capacity), _fmt_ah(saved_cap))
+            return
 
         reason = st.get('disabled_reason')
         if reason is not None:
             self.enabled, self.disabled_reason, self._disable_persistent = False, str(reason), True
+            self._withdraw = 'the estimator stays disabled: %s' % reason  # add() never runs to do it
             logger.info('%s: Qmax/SoH estimator stays disabled (saved state): %s', self.name, reason)
             return
 
@@ -1235,13 +1886,23 @@ class QmaxEstimator:
         c_q = v_opt_fin(st.get('charge_q'), 'charge_q')
         if (c_q is None) != (q_c is None):
             raise ValueError('charge_q %r with q_charge %r' % (c_q, q_c))
+        c_max = v_opt_fin(st.get('charge_max'), 'charge_max')
+        if c_max is not None and (c_src is None or c_max < 0):
+            raise ValueError('charge_max %r of counter %r' % (c_max, c_src))
+        # Any finite SoC: one outside 0..100 (a remaining charge above the
+        # capacity) is what the BMS said, and the stop rule takes it as a stop.
         last_soc = v_opt_fin(st.get('last_soc'), 'last_soc')
-        if last_soc is not None and not 0.0 <= last_soc <= 100.0:
-            raise ValueError('last_soc %r' % last_soc)
+        last_soc_raw = v_opt_fin(st.get('last_soc_raw'), 'last_soc_raw')
         last_cfull = v_opt_fin(st.get('last_charge_full'), 'last_charge_full')
         if last_cfull is not None and not last_cfull > 0:
             raise ValueError('last_charge_full %r' % last_cfull)
+        last_aged = v_opt_fin(st.get('last_aged'), 'last_aged')
+        if last_aged is not None and not last_aged > 0:
+            raise ValueError('last_aged %r' % last_aged)
         q_ah = v_fin(st.get('q_ah'), 'q_ah')
+        q_moved = v_fin(st.get('q_moved'), 'q_moved')
+        if q_moved < 0 or (c_q is not None and not 0 <= c_q <= q_moved):
+            raise ValueError('q_moved %r, charge_q %r' % (q_moved, c_q))
         covered = v_fin(st.get('covered_s'), 'covered_s')
         epoch = v_int(st.get('epoch'), 'epoch')
 
@@ -1255,7 +1916,7 @@ class QmaxEstimator:
                 out.append(s)
             return out
 
-        anchors = []
+        anchors, dropped = [], 0
         for a in st.get('anchors') or []:
             if not isinstance(a, dict):
                 raise ValueError('anchor is %r' % type(a).__name__)
@@ -1265,9 +1926,14 @@ class QmaxEstimator:
                 raise ValueError('anchor fit %r' % a.get('fit'))
             if v_int(a.get('epoch'), 'anchor epoch') > epoch:
                 raise ValueError('anchor epoch %r after the counter %d' % (a['epoch'], epoch))
-            if not CURVE_TEMP_LO <= v_fin(a.get('temp'), 'anchor temp') <= CURVE_TEMP_HI:
-                raise ValueError('anchor temp %r' % a['temp'])
+            kind = a.get('kind')
+            lo, hi = (TOP_TEMP_LO, TOP_TEMP_HI) if kind == 'top' else (CURVE_TEMP_LO, CURVE_TEMP_HI)
+            if kind not in ANCHOR_KINDS or not lo <= v_fin(a.get('temp'), 'anchor temp') <= hi:
+                raise ValueError('anchor kind %r, temp %r' % (kind, a.get('temp')))
             socs = soc_list(a.get('soc'), 'anchor soc')
+            if kind == 'top' and (a.get('mode') not in ('tail', 'cutoff') or not socs
+                                  or any(x != 100.0 for x in socs) or v_fin(a.get('i_rest'), 'anchor i_rest') != 0.0):
+                raise ValueError('top anchor %r' % (a,))
             why, ocv, fit = a.get('why'), a.get('ocv'), a.get('fit')
             if not (isinstance(why, list) and isinstance(ocv, list) and isinstance(fit, list)
                     and len(why) == len(ocv) == len(fit) == len(socs)):
@@ -1276,7 +1942,9 @@ class QmaxEstimator:
                 raise ValueError('anchor soc/why disagree')
             for o in ocv:
                 v_opt_fin(o, 'anchor ocv')
-            v_opt_fin(a.get('cap'), 'anchor cap')
+            if v_opt_fin(a.get('cap'), 'anchor cap') != self.design_capacity:
+                dropped += 1  # checked against another capacity than the option (above)
+                continue
             anchors.append(dict(a))
         if any(x['t'] > y['t'] for x, y in zip(anchors, anchors[1:])) or \
                 any(x['epoch'] > y['epoch'] for x, y in zip(anchors, anchors[1:])) or \
@@ -1299,21 +1967,58 @@ class QmaxEstimator:
                 raise ValueError('segment cells %r' % (s,))
             v_fin(s.get('spread'), 'segment spread')
             v_fin(s.get('cov'), 'segment cov')
-            v_opt_fin(s.get('cap'), 'segment cap')
+            kinds = s.get('kinds')
+            if not (isinstance(kinds, list) and len(kinds) == 2 and all(k in ANCHOR_KINDS for k in kinds)
+                    and kinds != ['top', 'top']):
+                raise ValueError('segment kinds %r' % (kinds,))
+            if v_opt_fin(s.get('cap'), 'segment cap') != self.design_capacity:
+                dropped += 1
+                continue
             segments.append(dict(s))
         if any(x['t'] > y['t'] for x, y in zip(segments, segments[1:])) or \
                 (segments and (last_t is None or segments[-1]['t'] > last_t)):
             raise ValueError('segments not in time order')
         last_seg_t = v_opt_fin(st.get('last_seg_t'), 'last_seg_t')
+        if dropped:
+            logger.warning('%s: Qmax/SoH: %d saved anchor(s)/segment(s) checked against another capacity than the '
+                           'option (%s) discarded', self.name, dropped, _fmt_ah(self.design_capacity))
 
         self._last_t, self._last_i, self.q_ah, self.covered_s, self.epoch = last_t, last_i, q_ah, covered, epoch
-        self._last_c, self._c_src, self.q_c, self._c_q = last_c, c_src, q_c, c_q
-        self._last_soc, self._last_cfull = last_soc, last_cfull
+        self.q_moved = q_moved
+        self._last_c, self._c_src, self.q_c, self._c_q, self._c_max = last_c, c_src, q_c, c_q, c_max
+        self._last_soc, self._last_soc_raw, self._last_cfull, self._last_aged = last_soc, last_soc_raw, last_cfull, \
+            last_aged
         self._t_glitch = v_opt_fin(st.get('t_glitch'), 't_glitch')
-        go = st.get('glitch_open', False)
-        if not isinstance(go, bool) or (go and (self._t_glitch is None or last_t is None)):
-            raise ValueError('glitch_open %r' % (go,))
-        self._glitch_open = go
+        nb = st.get('glitch_nb')
+        if nb is not None:
+            if not (isinstance(nb, dict) and set(nb) == {'before', 'after'} and self._t_glitch is not None
+                    and last_t is not None and all(isinstance(nb[k], list) for k in nb)
+                    and len(nb['before']) <= GLITCH_NB_N and len(nb['after']) < GLITCH_NB_N):
+                raise ValueError('glitch_nb %r' % (nb,))
+            nb = dict(before=[v_fin(v, 'glitch_nb') for v in nb['before']],
+                      after=[v_fin(v, 'glitch_nb') for v in nb['after']])
+        self._glitch_nb = nb
+        au = st.get('audit')
+        if au is not None:
+            if not (isinstance(au, dict) and set(au) == {'t', 'c', 'src', 'q', 'm', 'held'} and last_t is not None
+                    and _counter_src_ok(au['src']) and isinstance(au['held'], list)
+                    and v_fin(au['t'], 'audit t') <= last_t and 0 <= v_fin(au['m'], 'audit m') <= q_moved):
+                raise ValueError('audit %r' % (au,))
+            v_fin(au['c'], 'audit c')
+            v_fin(au['q'], 'audit q')
+            au = dict(au, held=[v_fin(x, 'audit held') for x in au['held']])
+        self._audit = au
+        bc = st.get('bms_caps')
+        if not isinstance(bc, list) or len(bc) > BMS_CAP_N or not all(isinstance(x, list) and len(x) == 2 for x in bc):
+            raise ValueError('bms_caps %r' % (bc,))
+        for x in bc:
+            if not v_fin(x[1], 'bms_caps') > 0 or v_fin(x[0], 'bms_caps t') > (last_t if last_t is not None else -1e300):
+                raise ValueError('bms_caps %r' % (bc,))
+        self._bms_caps.extend([float(x[0]), float(x[1])] for x in bc)
+        rec = st.get('recent')
+        if not isinstance(rec, list) or len(rec) > GLITCH_NB_N:
+            raise ValueError('recent %r' % (rec,))
+        self._recent.extend(v_fin(v, 'recent') for v in rec)
         self._resumed = last_t is not None  # the next sample decides whether the open segment goes on
         self.anchors.extend(anchors[-MAX_ANCHORS:])
         self.segments.extend(segments[-SUMMARY_K:])
@@ -1374,7 +2079,7 @@ class QmaxEstimator:
             self.pair_reasons.update({str(k): int(v) for k, v in (st.get('pair_reasons') or {}).items()})
             self.n_dropped = v_int(st.get('n_dropped') or 0, 'n_dropped')
             self._t_summary = v_opt_fin(st.get('t_summary'), 't_summary')
-        self._announced = bool(st.get('announced')) or len(self.segments) >= PUBLISH_MIN_SEGMENTS
+        self._announced = bool(st.get('announced')) or len(self._counted()) >= PUBLISH_MIN_SEGMENTS
 
         v = self.value
         logger.info('%s: Qmax/SoH state restored: %d anchors, %d segments%s, coulomb count %s, estimate %s '
@@ -1382,12 +2087,22 @@ class QmaxEstimator:
                     len(self.segments), (', newest from %s' % fmt_t(self.segments[-1]['t'])) if self.segments else '',
                     ('%+.1f Ah since %s' % (self.q_ah, fmt_t(last_t))) if last_t is not None else 'empty',
                     ('%.1f Ah' % v) if v is not None else
-                    'none yet (%d/%d segments)' % (len(self.segments), PUBLISH_MIN_SEGMENTS))
+                    'none yet (%d/%d segments)' % (len(self._counted()), PUBLISH_MIN_SEGMENTS))
 
 
 DEFAULT_CURVE = OcvCurve()
 
 # Anchors and segments are only restored into the code that made them: a change
 # to the curve or any gate would mix two definitions of Qmax. Computed last, over
-# the code that actually runs (estimator_common.code_fingerprint).
-CODE_FINGERPRINT = estimator_common.code_fingerprint(globals(), vars(estimator_common))
+# the code that actually runs (estimator_common.code_fingerprint): this module,
+# the shared helpers, and the one function of bms.py that derives inputs the
+# saved state depends on (the SoC and capacities the stop rule reads; rev8). Not
+# all of bms.py and sampling.py: every unrelated change there would discard
+# months of segments. What the sampler does with a sample is add_sample() and
+# best_temperature() here.
+def code_fingerprint() -> Optional[str]:
+    return estimator_common.code_fingerprint(
+        globals(), vars(estimator_common), {'__name__': _bms.__name__, 'derive_charge_fields': _bms.derive_charge_fields})
+
+
+CODE_FINGERPRINT = code_fingerprint()
