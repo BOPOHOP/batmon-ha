@@ -1,5 +1,6 @@
 
-bleak==2.0.0 # see Dockerfile
+#bleak==2.0.0 # see Dockerfile
+bleak
 #      ^ https://github.com/fl4p/batmon-ha/issues/275
 # aiobmsble is installed with --no-deps (see Dockerfile) so it can't drag bleak
 # to 3.x, so pull in its runtime dep here. brc 4.6.1 needs only bleak>=2, so the
