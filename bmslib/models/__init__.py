@@ -43,10 +43,12 @@ def get_bms_model_class(name: str):
         jk_uart='models.jikong_uart.JKUart',  # RS485/UART TLV protocol; use with address=serial
         daly_uart='models.daly_uart.DalyUart',  # RS485/USB-UART; same A5/04 frames as BLE
         jbd_uart='models.jbd_uart.JbdUart',  # JBD over TTL UART / RS485; same DD..77 frames as BLE
+        jbd_hv_uart='models.jbd_hv_uart.JbdHvUart',  # JBD / LWS high-voltage BMS (up to 200 cells), 3F 55 frames (#424)
         jk_pb_uart='models.jk_pb_uart.JkPbUart',  # JK-PB inverter BMS over RS485 (Modbus trigger, JK02_32S frame)
         seplos_uart='models.seplos_uart.SeplosUart',  # Seplos V2 ASCII protocol over RS485
         braunpwr_uart='models.braunpwr_uart.BraunPwrUart',  # BraunPWR / KS48100 rack BMS, YD/T 1363 over UART (#403)
         renogy_uart='models.renogy_uart.RenogyUart',  # Renogy smart lithium over RS485 Modbus RTU
+        felicity_uart='models.felicity_uart.FelicityUart',  # Felicity Solar 48V packs, Voltronic "LIB" over RS485 (#415)
         pace_uart='models.pace.PaceUart',  # PACE "paceic" RS232/RS485 ASCII protocol (#276)
         ant='models.ant.AntBt',
         victron='models.victron.SmartShuntBt',
@@ -185,5 +187,13 @@ def construct_bms(dev: dict, verbose_log: bool, bt_discovered_devices: list):
         # whole add-on, so every *other* configured battery never started.
         logger.exception('Cannot construct %s device %s, skipping it', slug, name)
         return None
+
+    # Display-only names. They deliberately do not change the alias, MQTT
+    # topic, or discovery unique_id, so renaming does not discard HA history.
+    bms.display_name = dev.get('display_name')
+    bms.temperature_names = [
+        value.strip() for value in (dev.get('temperature_names') or '').split(',')
+        if value.strip()
+    ]
 
     return bms

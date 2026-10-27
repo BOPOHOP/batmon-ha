@@ -400,6 +400,8 @@ async def main():
                 logger.info("mqtt connected to %s", user_config.mqtt_broker)
                 mqtt_connected.set()
                 bmslib.mqtt_util.subscribe_state_topics(client)
+                # switches, set SOC and JK settings commands (no-op before the first sample)
+                bmslib.mqtt_util.resubscribe_commands(client)
 
         def _on_disconnect(client, userdata, flags, reason_code, properties):
             # a refused CONNACK is followed by a disconnect too; only report
@@ -476,7 +478,8 @@ async def main():
     # GUI state sink. Lazily imported and guarded: a broken GUI must degrade to
     # "no GUI", never to a dead add-on (same shape as the InfluxDB sink above).
     gui_state = None
-    if user_config.get('gui', True):
+    # Off by default under HA: the GUI is unfinished and the ingress panel is disabled (#425).
+    if user_config.get('gui', os.environ.get('SUPERVISOR_TOKEN') is None):
         try:
             from bmslib.gui.state import GuiState, GuiStateSink
             gui_state = GuiState(app_version=ver, runtime=_runtime_kind())
@@ -484,7 +487,8 @@ async def main():
         except Exception as e:
             logger.warning('GUI state disabled: %s', e)
 
-    from bmslib.store import load_impedance_state, load_qmax_state
+    from bmslib.store import load_impedance_state, load_qmax_state, root_dir as store_root_dir
+    from bmslib.jk_settings_service import build_settings_service
 
     def design_capacity(name):
         """The per-device `capacity:` option [Ah], None when unset or unusable."""
@@ -521,6 +525,7 @@ async def main():
         soh_estimator=bool(user_config.get('soh_estimator', False)),
         soh_state=user_config.get('soh_estimator') and load_qmax_state(bms.name),
         design_capacity=design_capacity(bms.name),
+        settings_service=build_settings_service(bms, user_config, dev_args[bms.name], store_root_dir or '.'),
     ) for bms in bms_list]
 
     # move groups to the end

@@ -7,7 +7,12 @@ import types
 import pytest
 
 import bmslib.bt as bt_module
-from bmslib.models.jbd import JbdBt
+from bmslib.models.jbd import (
+    JbdBt,
+    _decode_jbd_date,
+    _decode_jbd_setting,
+    _jbd_write_command,
+)
 from bmslib.test._decode_helpers import run_fetch_with_response
 from bmslib.test.data import jbd_fixtures
 
@@ -117,6 +122,220 @@ def test_jbd_notification_waits_for_declared_frame_length_even_if_fragment_ends_
 
     assert bytes(bms._buffer) == fragment
     assert bms._last_response is None
+
+
+def test_jbd_factory_mode_write_frames():
+    assert _jbd_write_command(0x00, bytes.fromhex("5678")) == bytes.fromhex(
+        "dd5a00025678ff3077"
+    )
+
+
+def test_jbd_extended_settings_decode():
+    assert _decode_jbd_setting(0x10, bytes.fromhex("0514")) == 13.0
+    assert _decode_jbd_setting(0x11, bytes.fromhex("04b0")) == 12.0
+    assert _decode_jbd_setting(0x12, bytes.fromhex("1036")) == 4.15
+    assert _decode_jbd_setting(0x20, bytes.fromhex("1554")) == 54.6
+    assert _decode_jbd_setting(0x2A, bytes.fromhex("0f3c")) == 3.9
+    assert _decode_jbd_setting(0xA0, bytes.fromhex("0656656e646f72")) == "Vendor"
+    assert _decode_jbd_setting(0xA1, bytes.fromhex("074d6f64656c2031")) == "Model 1"
+
+
+def test_jbd_manufacture_date_and_write_frames():
+    assert _decode_jbd_date(0x3021) == "2024-01-01"
+    assert _jbd_write_command(0xE1, bytes.fromhex("0002")) == bytes.fromhex(
+        "dd5ae1020002ff1b77"
+    )
+    assert _jbd_write_command(0x01, bytes.fromhex("2828")) == bytes.fromhex(
+        "dd5a01022828ffad77"
+    )
+
+
+def _switch_bms(states, connected=True):
+    """JbdBt whose _fetch() reports `states` (list of (charge, discharge, problem_code)),
+    one per call, the last repeating; _w records writes."""
+    bms = JbdBt("00:11:22:33:44:55", name="jbd")
+    bms.client = types.SimpleNamespace(is_connected=connected)
+    bms._connect_complete = connected
+    writes = []
+    calls = iter(states)
+    last = [states[0]]
+
+    async def fake_w(command, data, timeout=None):
+        writes.append((command, data))
+
+    async def fake_fetch():
+        last[0] = next(calls, last[0])
+        c, d, p = last[0]
+        return types.SimpleNamespace(switches={"charge": c, "discharge": d}, problem_code=p)
+
+    bms._w = fake_w
+    bms._fetch = fake_fetch
+    return bms, writes
+
+
+SEQ_CHARGE_ON_DISCHARGE_OFF = [
+    (0x00, bytes.fromhex("5678")),
+    (0xE1, bytes.fromhex("0002")),
+    (0x01, bytes.fromhex("2828")),
+]
+
+
+def test_jbd_charge_on_uses_write_mode_and_preserves_discharge_off():
+    bms, writes = _switch_bms([(False, False, 0), (True, False, 0)])
+    asyncio.run(bms.set_switch("charge", True))
+    assert writes == SEQ_CHARGE_ON_DISCHARGE_OFF
+
+
+def test_jbd_switch_verification_reports_rejected_write():
+    bms, _ = _switch_bms([(False, False, 4096)])
+    with pytest.raises(RuntimeError, match="problem_code=4096"):
+        asyncio.run(bms.set_switch("charge", True))
+
+
+def test_jbd_retained_command_for_the_current_state_is_not_written():
+    bms, writes = _switch_bms([(True, True, 0)])
+    asyncio.run(bms.set_switch("charge", True))
+    assert writes == []
+
+
+def test_jbd_command_held_by_a_protection_is_written_once():
+    # over-temperature holds charge off; the user's "off" must still be written,
+    # or charge comes back when the protection clears
+    bms, writes = _switch_bms([(False, True, 0x0100)])
+    asyncio.run(bms.set_switch("charge", False))
+    assert [w[0] for w in writes] == [0x00, 0xE1, 0x01]
+    asyncio.run(bms.set_switch("charge", False))
+    assert len(writes) == 3
+
+
+def test_jbd_refused_write_is_not_repeated_every_sample():
+    # the algorithm asks for charge on every sample while a protection holds it
+    bms, writes = _switch_bms([(False, True, 4096)])
+    with pytest.raises(RuntimeError, match="problem_code"):
+        asyncio.run(bms.set_switch("charge", True))
+    asyncio.run(bms.set_switch("charge", True))  # within SWITCH_REWRITE_S: skipped
+    asyncio.run(bms.set_switch("charge", True))
+    assert len(writes) == 3
+    bms._written["charge"] = (True, bms._written["charge"][1] - bms.SWITCH_REWRITE_S - 1)
+    with pytest.raises(RuntimeError, match="problem_code"):
+        asyncio.run(bms.set_switch("charge", True))
+    assert len(writes) == 6
+
+
+def test_jbd_other_fet_keeps_the_commanded_state_not_the_protected_one():
+    # discharge was commanded on, a protection turned it off; switching charge
+    # must not latch discharge off
+    bms, writes = _switch_bms([(False, False, 0x0002), (True, False, 0x0002)])
+    bms._commanded["discharge"] = True
+    asyncio.run(bms.set_switch("charge", True))
+    assert writes[1] == (0xE1, bytes.fromhex("0000"))
+
+
+def test_jbd_switch_while_disconnected_is_applied_by_the_next_fetch():
+    bms, writes = _switch_bms([(False, False, 0), (True, False, 0)], connected=False)
+    asyncio.run(bms.set_switch("charge", True))
+    assert writes == []
+    sample = asyncio.run(bms.fetch())
+    assert writes == SEQ_CHARGE_ON_DISCHARGE_OFF
+    assert sample.switches["charge"] is True
+
+
+def test_jbd_pending_switch_retries_one_timed_out_status_read():
+    bms, writes = _switch_bms([(False, False, 0), (True, False, 0)], connected=False)
+    real_fetch = bms._fetch
+    calls = 0
+
+    async def flaky_fetch():
+        nonlocal calls
+        calls += 1
+        if calls == 1:
+            raise asyncio.TimeoutError()
+        return await real_fetch()
+
+    bms._fetch = flaky_fetch
+    asyncio.run(bms.set_switch("charge", True))
+    sample = asyncio.run(bms.fetch())
+
+    assert calls == 3  # timed-out status, retry, then post-write verification
+    assert writes == SEQ_CHARGE_ON_DISCHARGE_OFF
+    assert sample.switches["charge"] is True
+    assert bms._pending_switches == {}
+
+
+def test_jbd_pending_switch_survives_two_timed_out_status_reads():
+    bms, writes = _switch_bms([(False, False, 0)], connected=False)
+
+    async def timed_out_fetch():
+        raise asyncio.TimeoutError()
+
+    bms._fetch = timed_out_fetch
+    asyncio.run(bms.set_switch("charge", True))
+    with pytest.raises(asyncio.TimeoutError):
+        asyncio.run(bms.fetch())
+
+    assert writes == []
+    assert bms._pending_switches == {"charge": True}
+
+
+def _with_mos(frame, mos):
+    """`frame` (a _jbd_frame) with its MOS byte set and the checksum redone."""
+    frame = bytearray(frame[:-3])
+    frame[4 + 20] = mos
+    checksum = (0x10000 - sum(frame[2:])) & 0xFFFF
+    return bytes(frame) + checksum.to_bytes(2, 'big') + bytes([0x77])
+
+
+def _wire_bms(basic_replies, connected=False):
+    """JbdBt behind a fake GATT client: each 0x03 request is answered by the
+    next chunk list of `basic_replies` (the last repeating) through the real
+    notification handler; writes are acked. Returns (bms, 0x03 request count)."""
+    bms = JbdBt("00:11:22:33:44:55", name="jbd")
+    bms.TIMEOUT = 0.05
+    requests = [0]
+    replies = iter(basic_replies)
+    last = [basic_replies[0]]
+
+    async def write_gatt_char(uuid, data):
+        command = data[2]
+        if data[1] == 0x5A:  # register write: ack
+            chunks = [bytes([0xDD, command, 0x00, 0x00, 0x00, 0x00, 0x77])]
+        else:
+            requests[0] += 1
+            last[0] = next(replies, last[0])
+            chunks = last[0]
+        for chunk in chunks:
+            bms._notification_handler(None, chunk)
+
+    bms.client = types.SimpleNamespace(is_connected=connected, write_gatt_char=write_gatt_char)
+    bms._connect_complete = connected
+    return bms, requests
+
+
+def test_jbd_retry_after_a_lost_fragment_is_not_swallowed_by_it():
+    off, on = _with_mos(_jbd_frame(0), 0x02), _with_mos(_jbd_frame(0), 0x03)
+    # the first reply loses its tail: its head must not swallow the retry's
+    bms, requests = _wire_bms([[off[:20]], [off], [on]])
+    asyncio.run(bms.set_switch("charge", True))
+    sample = asyncio.run(bms.fetch())
+    assert requests[0] == 3  # timed out, retried, verified after the write
+    assert sample.switches["charge"] is True
+    assert bms._pending_switches == {}
+
+
+def test_jbd_timed_out_status_read_without_pending_switch_is_not_retried():
+    bms, requests = _wire_bms([[]])
+    with pytest.raises(asyncio.TimeoutError):
+        asyncio.run(bms.fetch())
+    assert requests[0] == 1
+
+
+def test_jbd_pending_switch_status_read_is_retried_only_once():
+    bms, requests = _wire_bms([[]])
+    asyncio.run(bms.set_switch("charge", True))
+    with pytest.raises(asyncio.TimeoutError):
+        asyncio.run(bms.fetch())
+    assert requests[0] == 2
+    assert bms._pending_switches == {"charge": True}
 
 
 def _fetch(bms, frame):
@@ -486,3 +705,182 @@ def test_jbd_backward_wall_clock_step_does_not_disturb_the_filter(fake_clock):
     assert bms._runtime_current_ewma.value == pytest.approx(blend2, rel=0.001), \
         "backward clock step spuriously reset the filter one poll later"
     assert s.runtime == pytest.approx(100.0 / blend2 * 3600, rel=0.01)
+
+
+def _reply(cmd: int, payload: bytes) -> bytes:
+    body = bytes([0x00, len(payload)]) + payload
+    return bytes([0xDD, cmd]) + body + ((0x10000 - sum(body)) & 0xFFFF).to_bytes(2, 'big') + b"\x77"
+
+
+def _device_info_bms(answers, enter_ok=True):
+    """JbdBt whose _q answers from `answers` (cmd -> payload) and times out otherwise."""
+    bms = JbdBt("00:11:22:33:44:55", name="jbd")
+    writes, queries = [], []
+
+    async def fake_w(command, data, timeout=None):
+        writes.append((command, data))
+        if command == 0x00 and not enter_ok:
+            raise asyncio.TimeoutError()
+
+    async def fake_q(command, timeout=None):
+        queries.append(command)
+        if command == 0x03:
+            return jbd_fixtures.SYSSI_3CELL["raw"]
+        if command in answers:
+            return _reply(command, answers[command])
+        raise asyncio.TimeoutError()
+
+    bms._w = fake_w
+    bms._q = fake_q
+    return bms, writes, queries
+
+
+def test_jbd_device_info_leaves_factory_mode_without_saving():
+    bms, writes, _ = _device_info_bms({0x10: bytes.fromhex("0514"), 0x16: bytes.fromhex("0001"),
+                                       0xA1: bytes.fromhex("074d6f64656c2031")})
+    bms.SETTING_REGISTERS = [0x10, 0x16, 0xA1]
+    di = asyncio.run(bms.fetch_device_info())
+    # 28 28 would save to EEPROM; a read must exit with 00 00
+    assert writes == [(0x00, bytes.fromhex("5678")), (0x01, bytes.fromhex("0000"))]
+    assert di.values["jbd/design_capacity"] == 13.0
+    assert di.model == "Model 1"
+    # clones share factory serials: never the HA device identifier
+    assert di.sn is None
+
+
+def test_jbd_device_info_stops_after_unanswered_registers():
+    bms, writes, queries = _device_info_bms({})
+    di = asyncio.run(bms.fetch_device_info())
+    assert queries == bms.SETTING_REGISTERS[:bms.SETTING_MAX_MISSES] + [0x03]
+    assert writes[-1] == (0x01, bytes.fromhex("0000"))
+    assert di.values == {}
+
+
+def test_jbd_device_info_without_factory_mode_still_returns_basic_info():
+    bms, writes, queries = _device_info_bms({}, enter_ok=False)
+    di = asyncio.run(bms.fetch_device_info())
+    assert queries == [0x03]
+    # the ack may be lost while the BMS entered: leave without saving anyway
+    assert writes == [(0x00, bytes.fromhex("5678")), (0x01, bytes.fromhex("0000"))]
+    assert di.sw_version == "8.0"
+
+
+def test_jbd_sampler_disconnect_waits_for_a_switch_write_in_flight():
+    # MQTT switch commands run concurrently with the sampler; a disconnect
+    # between factory-mode enter and exit would leave the BMS in factory mode
+    bms, writes = _switch_bms([(False, False, 0), (True, False, 0)])
+    bms.keep_alive = False
+    events = []
+    gate = asyncio.Event()
+
+    async def slow_w(command, data, timeout=None):
+        writes.append((command, data))
+        if command == 0x00:
+            await gate.wait()
+
+    async def fake_disconnect():
+        events.append(("disconnect", len(writes)))
+
+    bms._w = slow_w
+    bms.disconnect = fake_disconnect
+
+    async def run():
+        task = asyncio.create_task(bms.set_switch("charge", True))
+        await asyncio.sleep(0)
+        await asyncio.sleep(0)
+        exit_task = asyncio.create_task(bms.__aexit__(None, None, None))
+        await asyncio.sleep(0.01)
+        assert events == []  # still waiting for the write sequence
+        gate.set()
+        await task
+        await exit_task
+
+    asyncio.run(run())
+    assert events == [("disconnect", 3)]
+
+
+def test_jbd_refused_write_reaches_the_waiter_not_a_timeout():
+    bms = JbdBt("00:11:22:33:44:55", name="jbd")
+    body = bytes([0x80, 0x00])  # status 0x80: refused
+    refusal = bytes([0xDD, 0xE1]) + body + ((0x10000 - sum(body)) & 0xFFFF).to_bytes(2, 'big') + b"\x77"
+
+    class Client:
+        async def write_gatt_char(self, uuid, data):
+            bms._notification_handler(None, bytearray(refusal))
+
+    bms.client = Client()
+    with pytest.raises(ValueError, match="failed with status 0x80"):
+        asyncio.run(bms._w(0xE1, bytes.fromhex("0002"), timeout=0.5))
+
+
+def test_jbd_failed_write_is_retried_at_once():
+    bms, writes = _switch_bms([(False, True, 0)])
+    calls = []
+
+    async def failing_enter(command, data, timeout=None):
+        calls.append(command)
+        if command == 0x00:
+            raise asyncio.TimeoutError()
+
+    bms._w = failing_enter
+    with pytest.raises(asyncio.TimeoutError):
+        asyncio.run(bms.set_switch("charge", True))
+    assert "charge" not in bms._written
+    with pytest.raises(asyncio.TimeoutError):
+        asyncio.run(bms.set_switch("charge", True))
+    assert calls == [0x00, 0x00]
+
+
+def test_jbd_command_changed_elsewhere_without_protection_is_written_again():
+    # HA turned charge on, then the vendor app turned it off: a new "on" from
+    # HA within SWITCH_REWRITE_S must still be written
+    bms, writes = _switch_bms([(False, True, 0), (True, True, 0), (False, True, 0), (True, True, 0)])
+    asyncio.run(bms.set_switch("charge", True))
+    asyncio.run(bms.set_switch("charge", True))
+    assert [w[0] for w in writes] == [0x00, 0xE1, 0x01] * 2
+
+
+def test_jbd_command_queued_when_the_sampler_disconnected_meanwhile():
+    bms, writes = _switch_bms([(False, True, 0), (True, True, 0)])
+
+    async def run():
+        async with bms._io_lock:  # the sampler's __aexit__ holds the lock ...
+            task = asyncio.create_task(bms.set_switch("charge", True))
+            await asyncio.sleep(0)
+            bms.client.is_connected = False  # ... and disconnects
+            bms._connect_complete = False
+        await task
+
+    asyncio.run(run())
+    assert writes == [] and bms._pending_switches == {"charge": True}
+
+
+def test_jbd_periodic_reconnect_waits_for_a_switch_write_in_flight():
+    bms, writes = _switch_bms([(False, False, 0), (True, False, 0)])
+    events = []
+    gate = asyncio.Event()
+
+    async def slow_w(command, data, timeout=None):
+        writes.append((command, data))
+        if command == 0x00:
+            await gate.wait()
+
+    async def fake_force_disconnect(timeout=None):
+        events.append(len(writes))
+
+    bms._w = slow_w
+    bms._force_disconnect = fake_force_disconnect
+
+    async def run():
+        task = asyncio.create_task(bms.set_switch("charge", True))
+        await asyncio.sleep(0)
+        await asyncio.sleep(0)
+        cut = asyncio.create_task(bms.force_disconnect())
+        await asyncio.sleep(0.01)
+        assert events == []
+        gate.set()
+        await task
+        await cut
+
+    asyncio.run(run())
+    assert events == [3]

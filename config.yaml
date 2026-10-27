@@ -1,7 +1,7 @@
 name: "Batmon"
 description: "Monitor various BMS over bluetooth"
 url: https://github.com/fl4p/batmon-ha
-version: "2.24"
+version: "2.26"
 slug: "batmon"
 init: false
 host_dbus: true
@@ -30,13 +30,14 @@ privileged:
 # the serial port the user configures simply isn't visible inside the add-on.
 uart: true
 
-# Web GUI. Ingress works with host_network: true -- the Supervisor builds the
-# destination from the add-on's ip_address, and a host-network add-on reports the
-# Docker network gateway, not a nonexistent container IP.
-# The port is declared but NOT published: with host_network the socket is on the
-# host anyway, so `gui_allow_direct` (default false under HA) is what actually
-# gates non-ingress access. Ingress requests are authenticated by Home Assistant.
-ingress: true
+# Web GUI. The ingress panel stays off until the GUI is finished (#425); under HA
+# the GUI is opt-in with `gui: true`. Ingress works with host_network: true -- the
+# Supervisor builds the destination from the add-on's ip_address, and a
+# host-network add-on reports the Docker network gateway, not a nonexistent
+# container IP. The port is declared but NOT published: with host_network the
+# socket is on the host anyway, so `gui_allow_direct` (default false under HA) is
+# what actually gates non-ingress access.
+ingress: false
 ingress_port: 8099
 panel_icon: "mdi:car-battery"
 panel_title: "Batmon"
@@ -74,7 +75,8 @@ options:
   bt_power_cycle: false
   bt_power_cycle_on_error: false
   ble_stack: bleak
-  gui: true
+  # no `gui: true` default here: the Supervisor fills options from these defaults, which
+  # turned the unfinished GUI on under HA again (#425). Opt in with `gui: true`.
   gui_port: 8099
   # sample_period/publish_period/expire_values_after are kept here (and required
   # in the schema) so they render as normal, always-visible fields. They must NOT
@@ -105,7 +107,15 @@ schema:
       # design (nameplate) capacity in Ah: soh_estimator's reference, which it
       # needs to publish anything (the BMS-reported capacity is never used)
       capacity: "float?"
+      # JK settings this device may change from HA (needs `jk_settings: true`):
+      # `all` (every writable setting except critical ones) and/or a comma list
+      # of names. A bad name keeps the device read-only. See doc/JK-Settings.md.
+      settings_write: "str?"
       note: "str?"
+      display_name: "str?"
+      # Comma-separated HA display names, e.g. "Battery case,MOSFET".
+      # MQTT topics and unique IDs stay stable when these labels change.
+      temperature_names: "str?"
 
   mqtt_user: "str?"
   mqtt_password: "str?"
@@ -190,6 +200,11 @@ schema:
   # which nothing is published). Needs long rests near empty; see doc/SoH.md for
   # how rarely that gives a value.
   soh_estimator: "bool?"
+
+  # Read the settings of JK BMSes (BLE, JK02_32S protocol, firmware >= 11) and
+  # show them in HA. Read-only unless a device sets `settings_write`. See
+  # doc/JK-Settings.md.
+  jk_settings: "bool?"
 
   # Experimental: estimate the cell temperature of packs whose BMS only reports
   # a MOSFET temperature, as a `pack_temp_est` sensor. Room/outdoor topics are

@@ -41,6 +41,7 @@ batmon device connectors:
 * JBD / Xiaoxiang / LLT BMS (`jbd` over BLE, `jbd_uart` over TTL UART or RS485)
 * Seplos V2 BMS, 48 V rack packs (`seplos_ble`, `seplos_v2_ble` over BLE, `seplos_uart` over RS485)
 * Renogy smart lithium batteries (`renogy_ble` over BLE via the BT-2 dongle, `renogy_uart` over RS485)
+* Felicity Solar 48 V LiFePo4 packs (FLB48314TG1, FLB48100, LPBF48/LPBA48; `felicity` over BLE, `felicity_uart` over RS485)
 * JBD / Jiabaida/ Xiaoxiang / Overkill Solar BMS (`jbd`)
 * ANT BMS (`ant`)
 * Supervolt BMS (`supervolt`)
@@ -104,6 +105,8 @@ Add an entry for each device, such as:
   adapter: "hci0"            # switch the bluetooth hw adapter (optional)
   debug: true                # verbose log for this device only (optional)
   current_calibration: 1.0   # current [I] correction factor (optional)
+  display_name: House battery     # device name in HA; topics stay (optional)
+  temperature_names: Cell 1,Cell 2 # probe names in HA, in order (optional)
 ```
 
 `address` is the MAC address of the Bluetooth device. If you don't know the MAC address start the add-on, and you'll
@@ -111,7 +114,7 @@ find a list of visible Bluetooth devices in the add-on log. Alternatively you ca
 displayed in the discovery list.
 
 `type` can be `jk`, `jk_24s`, `jk_32s`, `jk_uart`, `jk_pb_uart`, `jbd`, `jbd_uart`, `ant`, `daly`, `daly2`, `daly_ble`, `daly_uart`,
-`pace_uart`, `seplos_uart`, `braunpwr_uart`, `renogy_uart`, `supervolt`, `sok`, `sok_legacy`, `basen`, `basen_uart`, `litime`, `offgridtec`, `bm6`, `bm2`, `victron`, or any tag listed under [Supported BLE Devices](#supported-ble-devices).
+`pace_uart`, `seplos_uart`, `braunpwr_uart`, `renogy_uart`, `felicity_uart`, `supervolt`, `sok`, `sok_legacy`, `basen`, `basen_uart`, `litime`, `offgridtec`, `bm6`, `bm2`, `victron`, or any tag listed under [Supported BLE Devices](#supported-ble-devices).
 For a mock BMS use `dummy`.
 
 `type: auto` (Bluetooth only) asks the device at every start which protocol it speaks and logs the `type:` to put in
@@ -121,6 +124,19 @@ with an error, never guessed. Any other BMS still needs its `type:` set by hand.
 
 With the `alias` field you can set the MQTT topic prefix and the name as displayed in Home Assistant.
 Otherwise, the name as found in Bluetooth discovery is used.
+
+`display_name` sets the device name shown in Home Assistant, and `temperature_names` names the temperature probes in
+order. Neither changes MQTT topics or unique IDs, so entity history is kept.
+
+For `jbd`, batmon also reads the identity and settings registers (manufacturer, model, manufacture date, capacity,
+protection thresholds, balancing, voltage curve) once per start and publishes them under `jbd/`. These registers need
+factory mode, which batmon leaves without saving, so no setting is changed.
+
+`jbd` charge and discharge switches write the MOS register inside factory mode, keep the other MOSFET's state, and
+read the state back, so a refused change is logged as an error. On firmware 3.2 this re-enabled charging after an
+undervoltage cut-off. It does not override an active protection; a state a protection holds is not rewritten for
+10 minutes, since each write saves to the BMS's EEPROM. With `keep_alive: false` a switch command waits for the next
+poll.
 
 If the device requires a PIN when pairing add `pin: "123456"` (and replace 123456 with the device's PIN). This is the
 case for the Victron SmartShunt and for newer JBD firmware (Liontron and other packs whose app asks for a 6-digit
@@ -174,6 +190,9 @@ For verbose logs of particular BMS add `debug: true`.
   MOSFET temperature, as a `Pack Temp (RC est.)` sensor. `pack_temp_room_topic` / `pack_temp_outdoor_topic` are MQTT
   topics carrying ambient temperatures (e.g. from HA's `mqtt_statestream`); both are optional, without them the
   estimate follows the MOSFET temperature, damped. See [bmslib/PACK_TEMP_RC_INTEGRATION.md](bmslib/PACK_TEMP_RC_INTEGRATION.md).
+* `jk_settings` (off by default) reads the settings of JK BMSes (BLE, firmware ≥ 11) and shows them in Home Assistant.
+  A device's `settings_write` (`all` and/or a comma list of names; `all` leaves out critical settings) makes them
+  changeable, with backup and read-back check. See [doc/JK-Settings.md](doc/JK-Settings.md).
 * `watchdog` stops the program on too many errors (make sure to enable the Home Assistant watchdog to restart the add-on
   after it exits)
 * For JK bms: set `type` to `jk_24s` for the older 24s version (firmware<11.x), `jk_32s` for the newer 32s version (fw>
@@ -199,6 +218,13 @@ Supported types (baud rate in parentheses):
   BLE `basen`.
 * `jbd_uart` (9600) — JBD / Xiaoxiang / LLT, same `DD … 77` frames as the BLE
   `jbd` (the BLE module is a UART bridge); TTL UART header or RS485 port.
+* `jbd_hv_uart` (9600) — JBD / LWS high-voltage BMS (HVBMS, up to 200 cells)
+  on its RS485 port: binary `3F 55 … 55 3F` replies to `01 A1 A5 B5`, the
+  protocol of the vendor PC tool (not the supplier's Modbus document). Cell
+  voltages and temperatures, current, SOC, pack and P+/P- voltage, MOS and
+  ambient temperature, insulation resistance. `jbd_hv_uart:<addr>` for the pack
+  address (default 1)
+  ([#424](https://github.com/fl4p/batmon-ha/issues/424)).
 * `jk_pb_uart` (115200) — JK-PB inverter BMS (PB1A16S, PB2A16S, ...) on its
   RS485-1 port: a Modbus FC16 trigger, answered with the JK02_32S frame the BLE
   driver decodes. `jk_pb_uart:<n>` selects the RS485 address set in the JK app
@@ -222,9 +248,17 @@ Supported types (baud rate in parentheses):
 * `renogy_uart` (9600) — Renogy smart lithium (RBT100LFP12, RBT200LFP12S, ...)
   Modbus RTU; `renogy_uart:<id>` for the slave id (default `0x30`; the
   RBT100LFP12SH-G1 uses `0xF7`).
+* `felicity_uart` (9600) — Felicity Solar 48 V packs (FLB48314TG1, FLB48100,
+  LPBF48/LPBA48) on the RS485 pins 5/6 of their RJ45 port: the Voltronic "LIB"
+  protocol, Modbus RTU function 0x03 with a 16-bit register count in place of
+  Modbus's byte count. `felicity_uart:<addr>` for the DIP-switch address
+  (default 1); several packs share one adapter, one device entry each. An
+  alternative to the BLE `felicity` for setups troubled by bonding or adapter
+  scan contention ([#415](https://github.com/fl4p/batmon-ha/issues/415)); it has
+  not been run on hardware yet, so no claim that it is the more reliable path.
 
-`pace_uart`, `basen_uart`, `jbd_uart`, `jk_pb_uart`, `seplos_uart`,
-`braunpwr_uart` and `renogy_uart` decoders are unit-tested against captured or
+`pace_uart`, `basen_uart`, `jbd_uart`, `jbd_hv_uart`, `jk_pb_uart`, `seplos_uart`,
+`braunpwr_uart`, `renogy_uart` and `felicity_uart` decoders are unit-tested against captured or
 reference frames but not yet confirmed on live hardware — feedback welcome. The
 protocols were ported from dbus-serialbattery, aiobmsble and the syssi ESPHome
 components; see the module docstrings for the exact sources.
@@ -244,6 +278,10 @@ HCI index. As an HA add-on this works out of the box (the manifest sets
 `uart: true`, mapping the host's serial devices into the container) — prefer
 the stable `/dev/serial/by-id/...` path so the port survives re-plugging.
 Running standalone on Linux, add your user to the `dialout` group.
+
+A serial adapter on a network serial server (ser2net, an ESP USB gateway, …) works
+as `adapter: tcp://192.168.1.108:8880` (raw TCP) or `rfc2217://host:port`. With raw
+TCP, set the baud rate on the server.
 
 ### Daly board number
 
@@ -383,8 +421,8 @@ adapter:
 | `bumble` | Same — pick one adapter (bumble will take it exclusively). | First available |
 | `esphome` | **Leave unset.** There's no local adapter; the proxy host stack picks the best-RSSI proxy automatically per connect. | n/a — auto-routed |
 
-(For `address: serial` / RS-485 BMSes, `adapter:` is the serial port path like `/dev/ttyUSB0`,
-independent of `ble_stack`.)
+(For `address: serial` / RS-485 BMSes, `adapter:` is the serial port path like `/dev/ttyUSB0`
+or a network port like `tcp://host:8880`, independent of `ble_stack`.)
 
 `adapter:` can also be set once at the top level of the configuration, next to `ble_stack:`. It
 is then the default for every device that doesn't carry its own, and the log says which devices

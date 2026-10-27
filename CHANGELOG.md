@@ -1,5 +1,27 @@
 ## [unreleased]
 
+* Fix: the web GUI still started under Home Assistant in 2.26 (unreachable, as its ingress panel was removed), because the add-on's default options set `gui: true` (#425).
+
+## [2.26]
+
+* New wired type `jbd_hv_uart` for JBD / LWS high-voltage BMSes (up to 200 cells) on RS485. Decoded from the reporter's captures and checked against the vendor tool's export (#424).
+* Wired BMSes can use a network serial server: `adapter: tcp://host:port` (or `rfc2217://`). Before, the URL was cut at its last colon and `8880` opened as a file (#422).
+* Fix (wired): a port that failed to open at start (adapter unplugged, gateway down) was never reopened after a later dropout; only a restart helped (#422).
+* The unfinished web GUI is off under Home Assistant again: its ingress panel only answered 403 `direct access disabled`. Opt in with `gui: true` (#425).
+* Fix (`jbd`): a switch command queued with `keep_alive: false` waited a full sample period after one lost status reply. The read is now retried once (#423, thanks @tednv).
+* JK BLE (fw ≥ 11): `jk_settings: true` shows the BMS settings (protection voltages, currents, temperatures, switches) in Home Assistant as diagnostic entities (doc/JK-Settings.md, #420, thanks @sayezz).
+* JK BLE: per-device `settings_write` makes JK settings changeable from Home Assistant, with range and cross-field checks, backup, read-back verification and an audit log (doc/JK-Settings.md, #421, thanks @sayezz).
+* Fix: switches and set SOC stopped reacting after an MQTT broker restart, because their command subscriptions were lost. They are now re-subscribed (#420).
+* Fix (`jk`): a switch or set-SOC command sent right after a settings read could be acknowledged by the BMS and then ignored. It waits 1 s after the read (#421).
+
+## [2.25]
+
+* Fix (`_ble` types): only the mean of the BMS's temperature probes was published. Now every probe has its own `temperatures/<n>`, and the MOSFET probe is `mosfet_status/temperature` (#417).
+* New wired type `felicity_uart` for Felicity 48 V packs: the BLE `felicity` needs bonding and loses the link to scan contention. Voltronic protocol, decoded against captures only (#415).
+* `jbd` switches now write inside factory mode, keep the other MOSFET's state and read the result back. This re-enabled charging after an undervoltage cut-off (#418, thanks @tednv).
+* Fix: a refused algorithm switch write (e.g. held by a BMS protection) no longer drops the sample.
+* `jbd` publishes its identity and settings registers under `jbd/` (read once per start, factory mode left without saving) (#418).
+* New device options `display_name` and `temperature_names` rename the HA device and temperature probes; topics and unique IDs stay (#418).
 * Fix (`soh_estimator`): a withdrawn Qmax/SoH was cleared by one MQTT publish; a failed one or a Home Assistant restart brought the old value back. Now retried and repeated hourly.
 * Experimental `soh_estimator` can now publish: a charge end (CV tail or BMS cut, every cell at 3.40 V, a probe at 15 °C or more) anchors SoC 100 % (doc/SoH.md).
 * `soh_estimator` with `capacity:` set now fetches cell voltages every 10 s while charging. Qmax reads up to a few % low when the charger's absorption voltage is low.

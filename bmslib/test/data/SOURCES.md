@@ -44,6 +44,8 @@ Other promising JBD captures I logged but didn't bake in yet:
 | `NEW11_16S` | inline | `bmslib/models/dummy.py:131` — `JKDummy.MSGS[1]` (the `is_new_11x` branch). 16S 11.x firmware. Only cell voltages are pinned because the dummy's settings frame is the 8-cell one. |
 | `ISSUE_365_B2A8S20P` | harvested | [#365 comment](https://github.com/fl4p/batmon-ha/issues/365#issuecomment-4528134871) — albertdb's JK_B2A8S20P fw 11.50 capture. BLE notifications stitched into 300-byte 0x01 and 0x02 frames (`jk_issue365_settings.bin`, `jk_issue365_status.bin`); both CRC-verified. Pins the fix: cell-info offset 178 reports a BMS-aged 251 Ah while settings offset 130 holds the user-set 320 Ah. SOH=79%, SOC=66%, 427 cycles. |
 | `SYSSI_BLE_16S` | harvested | [`syssi/esphome-jk-bms` — `components/jk_bms_ble/jk_bms_ble.cpp:430-432`](https://github.com/syssi/esphome-jk-bms/blob/main/components/jk_bms_ble/jk_bms_ble.cpp#L430). First of six annotated 300-byte example responses syssi shipped in the BLE component header comment (frame counter 0x8C). 16-cell pack, JK02_24S frame variant; every byte is labelled with the field it drives and a worked example value. Cross-checks 13 batmon-ha decoder fields against syssi's annotations (voltage, current, SOC, charge, capacity, cycles, T1/T2, MOS T, balance current, switches, uptime, cell voltages). CRC byte 0xCD matches sum-mod-256 of preceding 299 bytes. Settings frame is synthesised because batmon-ha's `JKDummy` settings is 8-cell and would lie about `num_cells` / `capacity`. |
+| `jk_settings_b2a8s30p_fw15.26.bin` | captured | JK-B2A8S30P hw 15A fw 15.26 (4S LFP 280 Ah), 300-byte 0x01 settings frame read over BLE with `tools/jk_dump_settings.py` on 2026-10-15, CRC-verified. Settings as set in the JK app that day (charge current 140 A, UVP/UVPR 2.65/2.70 V, charge UTP/UTPR 2/5 °C, charge OTP/OTPR 50/45 °C). Used by the settings decoder tests. |
+| `jk_settings_b2a8s30p_fw17.06.bin` | captured | Same model, hw 17H fw 17.06, same session and tool. Same settings except UVP 2.60 V and MOSFET OTP/OTPR 80/70 °C. Used by the settings decoder tests. |
 
 Higher-quality JK fixtures I noted for future work (assembled 300-byte frames
 posted by real users):
@@ -116,6 +118,26 @@ request-builder address byte and the BLE connect/notify glue change.
 | Fixture | Type | Source |
 |---|---|---|
 | `AIOBMSBLE_4S` | harvested | [`patman15/aiobmsble` — `tests/bms/test_daly_bms.py`](https://github.com/patman15/aiobmsble/blob/main/tests/bms/test_daly_bms.py) `MockDalyBleakClient.RESP_INFO`. 133-byte 4S/4-temp CMD_INFO response. Apache-2.0. |
+
+---
+
+## Felicity Solar RS485 (Voltronic "LIB", 16-bit register count) — `felicity_uart_fixtures.py`
+
+| Fixture | Type | Source |
+|---|---|---|
+| `STATUS_*`, `CELLS_*`, `LIMITS_*`, `TRUNCATED_*`, `REQ_*` | harvested | [`KrzysztofHajdamowicz/felicity-battery-modbus` — `captures/2026-10-10-rs485-bus.log`](https://github.com/KrzysztofHajdamowicz/felicity-battery-modbus/blob/main/captures/2026-10-10-rs485-bus.log) (MIT). Live RS485 traffic of three FLB48314TG1 packs at DIP addresses 1-3, 9600 8N1; each fixture carries the capture timestamp of its frame. `STATUS_1_DOC_EXAMPLE` is the 13:03:34 frame that the project's `docs/protocol.md` §5 works through by hand (53.41 V, −1.9 A, −101 W, SOC 95 %, 350.0 Ah, 28.1 °C), which is the test's independent ground truth. The two `TRUNCATED_*` frames are the reporter's USB-RS485 adapter losing the CRC high byte and the slave address. |
+| version block, limits/status blocks with distinct words per register, the echo / noise / foreign-frame / exception cases in `test_felicity_uart_decode.py` | synthesized | None of these are in the capture. The version block (registers 1-6) was never polled on the wire; `docs/protocol.md` reports it answered by firmware 1.1 via `felicityd`, and the fixture follows the documented layout. The all-distinct-register blocks exist because the real frames repeat values (480 in both registers 113 and 114, `0x0001_0001` for both version words, 3012 across the probes), which hides an off-by-one register. The alarm registers 55-60 are not decoded at all, so there is no alarm fixture — see the note in `bmslib/models/felicity_uart.py`. |
+
+All 101 CRC-valid responses in that capture were replayed through
+`bmslib/models/felicity_uart.py` while writing it: every one decodes (cells
+3338-3344 mV, 53.40-53.49 V, 27.05/28.05 °C, SOC 95-96 %, 350.0 Ah), and the 10
+damaged frames are rejected — the same 101/10 split the upstream decoder reports.
+
+Protocol references:
+[`docs/protocol.md`](https://github.com/KrzysztofHajdamowicz/felicity-battery-modbus/blob/main/docs/protocol.md),
+[`tools/felicity_decoder.py`](https://github.com/KrzysztofHajdamowicz/felicity-battery-modbus/blob/main/tools/felicity_decoder.py),
+and the vendor document Voltronic Power, *Inverter and BMS 485 communication
+Protocol*, 2020-03-25.
 
 ---
 
