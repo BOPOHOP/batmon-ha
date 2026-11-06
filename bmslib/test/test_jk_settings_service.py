@@ -17,10 +17,20 @@ def _fixture():
         return f.read()
 
 
-def _make(ignore_writes=False):
+def _fixture_without_rcv_rfv():
+    # HW 11A / FW 11.54 (#426): RCV (offset 38) and RFV (42) read 0, writes to them do nothing
+    from bmslib.models.jikong import calc_crc
+    frame = bytearray(_fixture())
+    frame[38:46] = bytes(8)
+    frame[-1] = calc_crc(frame[:-1])
+    return bytes(frame)
+
+
+def _make(ignore_writes=False, frame=None):
     bms = JKBt("00:11:22:33:44:55", name="jk1")
     bms.WRITE_SETTLE_S = bms.READBACK_DELAY_S = 0  # write timing is covered in test_jk_settings_driver
-    client = JKDummy(is_new_11x=True, settings_frame=_fixture(), ignore_writes=ignore_writes, stream=False)
+    client = JKDummy(is_new_11x=True, settings_frame=frame or _fixture(), ignore_writes=ignore_writes,
+                     stream=False)
     bms.client = client
     bms.char_handle_write = JKBt.CHAR_UUID
     bms.is_new_11fw_32s = True
@@ -152,6 +162,21 @@ def test_cross_field_rejected_message(tmp_path):
     text = pub.texts[-1]
     assert text.startswith('Rejected charge_utp 6: ')
     assert 'charge_utpr' in text and text.endswith('first')
+
+
+def test_firmware_without_rcv(tmp_path):
+    bms, client = _make(ignore_writes=True, frame=_fixture_without_rcv_rfv())
+    svc, pub = _service(tmp_path, writable={'cell_rcv', 'cell_rfv', 'cell_soc100_voltage'}), FakePublish()
+    svc.enqueue('cell_rcv', '3.55')
+    svc.enqueue('cell_rfv', '3.4')
+    _tick(svc, bms, pub)
+    assert client.writes == []
+    assert pub.texts == ['Rejected cell_rcv 3.55: not supported by this firmware (reads 0)',
+                         'Rejected cell_rfv 3.4: not supported by this firmware (reads 0)']
+    assert not svc.locked
+    svc.enqueue('cell_soc100_voltage', '3.5')  # was rejected against RCV 0 V
+    _tick(svc, bms, pub)
+    assert len(client.writes) == 1 and client.writes[0][0] == 0x07
 
 
 def test_out_of_range_rejected(tmp_path):
@@ -684,3 +709,39 @@ def test_corrupt_settings_read_is_not_used_to_validate(tmp_path):
     assert client.writes == []
     assert pub.texts[-1].startswith('Rejected charge_utp 3: settings read looks corrupt')
     assert not svc.locked
+
+
+def test_a_capacity_write_goes_through_the_counter_write(tmp_path):
+    """It rescales the BMS's charge counter, which the Qmax/SoH estimator takes
+    as evidence across a restart (BmsSampler.counter_write); other settings
+    do not."""
+    bms, client = _make()
+    svc, pub = _service(tmp_path, writable={'total_capacity', 'charge_utp'}), FakePublish()
+    _tick(svc, bms, pub)
+    calls = []
+
+    async def counter_write(why, write, capacity_change=False):
+        calls.append((why, capacity_change))
+        return await write()
+    svc.counter_write = counter_write
+    cap = bms.settings['total_capacity']
+    svc.enqueue('total_capacity', str(cap + 10))
+    svc.enqueue('charge_utp', '4')  # below charge_utpr (5)
+    _tick(svc, bms, pub)
+    assert calls == [('total_capacity write', True)]
+    assert bms.settings['total_capacity'] == cap + 10 and len(client.writes) == 2
+
+
+def test_a_capacity_write_is_not_sent_when_the_counter_write_refuses(tmp_path):
+    from bmslib.estimator_common import CounterWriteRefused
+    bms, client = _make()
+    svc, pub = _service(tmp_path, writable={'total_capacity'}), FakePublish()
+    _tick(svc, bms, pub)
+
+    async def counter_write(why, write, capacity_change=False):
+        raise CounterWriteRefused('disk full')
+    svc.counter_write = counter_write
+    svc.enqueue('total_capacity', str(bms.settings['total_capacity'] + 10))
+    _tick(svc, bms, pub)
+    assert client.writes == [] and not svc.locked
+    assert pub.texts[-1].startswith('Rejected total_capacity') and 'disk full' in pub.texts[-1]

@@ -1,11 +1,11 @@
 """Daly UART/RS485 decoder + framing regression tests."""
-import struct
+import asyncio
 
 import pytest
 
 import bmslib.wired
 from bmslib.models import daly_uart as du
-from bmslib.models.daly import daly_command_message
+from bmslib.models.daly import DalyBt, daly_command_message
 from bmslib.test.data import daly_uart_fixtures as fx
 
 
@@ -115,10 +115,10 @@ def test_set_switch_uses_the_wired_address(uart_bms):
     assert set(msg[5:12]) == {0xAA}
 
 
-def test_uart_and_ble_request_frames_differ_only_in_address_byte():
-    """The on-wire difference between UART and BLE is exactly one byte:
-    position 1 (the host-address nibble). Everything else — header, CRC
-    layout, payload zero-padding — is identical."""
+def test_base_builders_differ_only_in_address_byte():
+    """With the same zero fill, the base builder's UART and BLE requests differ
+    in exactly one byte: position 1 (the host address). The real wired builder
+    also uses the 0xAA fill, covered by test_uart_requests_are_aa_filled."""
     for cmd in (0x90, 0x93, 0x94, 0x95):
         uart = bytes(daly_command_message(cmd, address=4))
         ble = bytes(daly_command_message(cmd, address=8))
@@ -198,6 +198,22 @@ def test_feed_buffer_drops_bad_crc_frame_and_resyncs():
     assert out == good  # bad one silently dropped
 
 
+def test_fetch_states_flags_byte_with_high_bit(uart_bms):
+    """A flags byte >= 0x80 (here the reflected 0xAA request fill) must decode,
+    not raise on bin(-86) (#429)."""
+    bms = uart_bms()
+
+    async def fake_q(cmd, num_responses=1):
+        return fx.STATES_4S_AA_FLAGS["frame"][4:-1]
+
+    bms._q = fake_q
+    data = asyncio.run(bms.fetch_states())
+    assert data["num_cells"] == 4
+    assert data["num_cycles"] == 1
+    for pin, val in fx.STATES_4S_AA_FLAGS["expected"]["states"].items():
+        assert data["states"][pin] is val, pin
+
+
 # === Payload decoders (re-use DalyBt decode logic on UART payloads) ========
 
 def _payload_of(frame):
@@ -208,29 +224,39 @@ def _payload_of(frame):
 
 @pytest.mark.parametrize("fixture", fx.ALL_RESPONSES, ids=lambda f: f["name"])
 def test_payload_matches_ble_decoder_expectations(fixture):
-    """The 8-byte payload extracted from a UART frame must decode identically
-    to a BLE payload — same struct format, same scaling factors."""
+    """The 8-byte payload extracted from a UART frame must decode through the
+    real DalyBt decoders — no copy of their struct formats here."""
     payload = _payload_of(fixture["frame"])
     cmd = fixture["cmd"]
     exp = fixture["expected"]
 
+    bms = DalyBt("00:11:22:33:44:55", name="daly")
+    bms._states = {"num_cycles": 0}
+
+    async def fake_q(command, num_responses=1):
+        return payload
+
+    bms._q = fake_q
+
     if cmd == 0x90:
-        v, _x, i, soc = struct.unpack(">h h h h", payload)
-        assert v / 10 == pytest.approx(exp["voltage"], abs=0.05)
-        assert (i - 30000) / 10 == pytest.approx(exp["current"], abs=0.05)
-        assert soc / 10 == pytest.approx(exp["soc"], abs=0.05)
+        sample = asyncio.run(bms.fetch_soc(sample_kwargs=dict(charge=1.0, switches={})))
+        assert sample.voltage == pytest.approx(exp["voltage"], abs=0.05)
+        assert sample.current == pytest.approx(exp["current"], abs=0.05)
+        assert sample.soc == pytest.approx(exp["soc"], abs=0.05)
     elif cmd == 0x93:
-        mode, charging_mos, discharging_mos, _b, mah = struct.unpack(">b ? ? B l", payload)
-        assert mode == {"stationary": 0, "charging": 1, "discharging": 2}[exp["mode"]]
-        assert charging_mos == exp["charging_mosfet"]
-        assert discharging_mos == exp["discharging_mosfet"]
-        assert mah / 1000 == pytest.approx(exp["capacity_ah"], abs=0.005)
+        status = asyncio.run(bms._fetch_status())
+        assert status["mode"] == exp["mode"]
+        assert status["charging_mosfet"] is exp["charging_mosfet"]
+        assert status["discharging_mosfet"] is exp["discharging_mosfet"]
+        assert status["capacity_ah"] == pytest.approx(exp["capacity_ah"], abs=0.005)
     elif cmd == 0x94:
-        n_cells, n_temps, charging, discharging, _bits, cycles = struct.unpack(
-            ">b b ? ? b h x", payload
-        )
-        assert n_cells == exp["num_cells"]
-        assert n_temps == exp["num_temps"]
-        assert charging == exp["charging"]
-        assert discharging == exp["discharging"]
-        assert cycles == exp["num_cycles"]
+        data = asyncio.run(bms.fetch_states())
+        assert data["num_cells"] == exp["num_cells"]
+        assert data["num_temps"] == exp["num_temps"]
+        assert data["charging"] is exp["charging"]
+        assert data["discharging"] is exp["discharging"]
+        assert data["num_cycles"] == exp["num_cycles"]
+        for pin, val in exp["states"].items():
+            assert data["states"][pin] is val
+    else:
+        pytest.fail("unhandled cmd 0x%02x in fixture %s" % (cmd, fixture["name"]))

@@ -368,7 +368,7 @@ class DalyBt(BtBms):
         timestamp = time.time()
         resp = await self._q(0x90)
 
-        parts = struct.unpack('>h h h h', resp)
+        parts = struct.unpack('>h h H h', resp)
 
         # x_v =  parts[1] / 10,  # always 0 "x_voltage", acquisition
 
@@ -427,17 +427,10 @@ class DalyBt(BtBms):
 
         response_data = await self._q(0x94)
 
-        parts = struct.unpack('>b b ? ? b h x', response_data)
+        parts = struct.unpack('>B B ? ? B H x', response_data)
 
-        state_bits = bin(parts[4])[2:]
         state_names = ["DI1", "DI2", "DI3", "DI4", "DO1", "DO2", "DO3", "DO4"]
-        states = {}
-        state_index = 0
-        for bit in reversed(state_bits):
-            if len(state_bits) == state_index:
-                break
-            states[state_names[state_index]] = bool(int(bit))
-            state_index += 1
+        states = {name: bool(parts[4] >> i & 1) for i, name in enumerate(state_names)}
 
         # dshOFF
         # bytearray(b'\x08\x01\x00\x00\x02\x005\xdc')
@@ -464,9 +457,11 @@ class DalyBt(BtBms):
 
         num_resp = math.ceil(num_cells / 3)  # bms sends tuples of 3 (ceil)
         resp = await self._q(0x95, num_responses=num_resp)
+        if num_resp == 1:
+            resp = [resp]
         voltages = []
         for i in range(num_resp):
-            v = struct.unpack(">b 3h x", resp[i])
+            v = struct.unpack(">b 3H x", resp[i])
             if v[0] != i + 1:
 
                 raise ValueError("out-of-order frame %s != #%s" % (v, i + 1))
@@ -484,7 +479,7 @@ class DalyBt(BtBms):
         if n_resp == 1:
             resp = [resp]
         for i in range(n_resp):
-            v = struct.unpack(">b 7b", resp[i])
+            v = struct.unpack(">b 7B", resp[i])
             assert v[0] == i + 1, "out-of-order frame %s != #%s" % (v, i + 1)
             temperatures += v[1:]
         return [t - 40 for t in temperatures[:num_sensors]]

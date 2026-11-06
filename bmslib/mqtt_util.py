@@ -10,6 +10,7 @@ import math
 import queue
 import time
 import traceback
+from typing import Optional
 from unittest.mock import patch
 
 import paho.mqtt.client as paho
@@ -182,8 +183,13 @@ def publish_temperatures(client, device_topic, temperatures):
 CELL_RESISTANCE_EXPIRE_S = 24 * 3600
 
 
-def publish_cell_resistance(client, device_topic, value_mohm: float):
-    mqtt_single_out(client, f"{device_topic}/cell_resistance", round_to_n(value_mohm, 3))
+def publish_cell_resistance(client, device_topic, value_mohm: Optional[float], attributes: Optional[dict] = None):
+    """value_mohm: the resistance normalised to 25 degC, None when there is none
+    (the attributes then say why); attributes: CellResistanceEstimator.attributes()."""
+    if attributes is not None:
+        mqtt_single_out(client, f"{device_topic}/cell_resistance/attributes", json.dumps(attributes))
+    if value_mohm is not None:
+        mqtt_single_out(client, f"{device_topic}/cell_resistance", round_to_n(value_mohm, 3))
 
 
 # Qmax/SoH (bmslib/qmax.py) is published once per accepted segment -- weeks
@@ -343,9 +349,11 @@ def publish_hass_discovery(client, device_topic, expire_after_seconds: int, samp
         _hass_discovery('meter/%s' % name, **m, long_expiry=True, precision=2)
 
     if cell_resistance:
-        # experimental, see bmslib/impedance.py: median per-cell resistance [mOhm]
+        # experimental, see bmslib/impedance.py: median per-cell resistance,
+        # normalised to 25 degC [mOhm]; the attributes say how
         _hass_discovery('cell_resistance', None, "mΩ", state_class="measurement", icon="resistor",
-                        name="Cell Resistance", precision=2, expire_after=CELL_RESISTANCE_EXPIRE_S)
+                        name="Cell Resistance", precision=2, expire_after=CELL_RESISTANCE_EXPIRE_S,
+                        json_attributes_topic=f"{device_topic}/cell_resistance/attributes")
 
     if soh_est:
         # experimental, see bmslib/qmax.py: capacity of the limiting cell [Ah], and
@@ -679,9 +687,12 @@ def subscribe_switches(mqtt_client: paho.Client, device_topic, bms: BtBms, switc
     async def set_switch(switch_name: str, state: bool):
         assert isinstance(state, bool)
         logger.info('Set %s %s switch %s', bms.name, switch_name, state)
-        await bms.set_switch(switch_name, state)
+        ok = await bms.set_switch(switch_name, state)
         topic = f"{device_topic}/switch/{switch_name}"
-        mqtt_single_out(mqtt_client, topic, 'ON' if state else 'OFF')
+        # A driver returns False when the BMS refused the write. Don't echo the
+        # requested state then; the next sample publishes the real register.
+        if ok is not False:
+            mqtt_single_out(mqtt_client, topic, 'ON' if state else 'OFF')
 
     node_id = device_topic.replace('/', '_')
     for switch_name in switches:
@@ -692,11 +703,16 @@ def subscribe_switches(mqtt_client: paho.Client, device_topic, bms: BtBms, switc
             lambda msg, sn=switch_name: set_switch(sn, msg.lower() == "on")
 
 
-def subscribe_set_soc(mqtt_client: paho.Client, device_topic, bms: BtBms):
+def subscribe_set_soc(mqtt_client: paho.Client, device_topic, bms: BtBms, counter_write=None):
+    """counter_write: BmsSampler.counter_write when the Qmax/SoH estimator runs
+    (the write moves the BMS's charge counter, which it takes as evidence)."""
     async def set_soc(payload: str):
         soc = float(payload)
         logger.info('Set %s SOC gauge to %.1f%%', bms.name, soc)
-        await bms.set_soc(soc)
+        if counter_write is None:
+            await bms.set_soc(soc)
+        else:
+            await counter_write('set SOC to %.1f%%' % soc, lambda: bms.set_soc(soc))
 
     node_id = device_topic.replace('/', '_')
     topic = f"homeassistant/number/{node_id}/set_soc/set"

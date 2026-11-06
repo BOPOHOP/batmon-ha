@@ -86,44 +86,69 @@ class Daly2Bt(BtBms):
         self._last_block = None
         self.UUID_RX = None
         self.UUID_TX = None
+        # Some modules (and a proxy that has only just brought the link up)
+        # drop the first request after connecting; daly.py's handshake re-asks
+        # for the same reason (#416). Retry that first request once.
+        self._first_reply_pending = False
+        # Payload length of the read in flight, so a stale tail cannot pass for
+        # a 0x03 reply header with a bogus bytecount and stall the parse.
+        self._read_bytecount = None
 
     def _notification_handler(self, _sender, data):
         self.logger.debug("ble data frame %s", data)
         self._buffer += data
 
-        if len(self._buffer) < 3:
-            return
+        # A reply cut off by a timeout leaves a partial frame behind, and its
+        # tail arrives after the retry cleared the buffer: parsed as a frame
+        # head it can swallow the retry's own reply. Every reply starts with
+        # the slave address, so resync on it; on a bad length or CRC drop that
+        # one sync byte and look for the next address instead of clearing the
+        # buffer, which would take the retry's reply with it.
+        while self._buffer:
+            while self._buffer and self._buffer[0] != MODBUS_ADDRESS:
+                del self._buffer[0]
 
-        func = self._buffer[1]
-        if func == MODBUS_READ_HOLDING:
-            # [addr][0x03][bytecount][...data...][crc_lo][crc_hi]
-            expected = 3 + self._buffer[2] + 2
-        elif func == MODBUS_WRITE_SINGLE:
-            # echo: [addr][0x06][reg_hi][reg_lo][val_hi][val_lo][crc_lo][crc_hi]
-            expected = 8
-        elif func & 0x80:
-            # exception: [addr][func|0x80][exc_code][crc_lo][crc_hi]
-            expected = 5
-        else:
-            self.logger.warning("daly2 unexpected func 0x%02x: %s", func, self._buffer.hex())
-            self._buffer.clear()
-            return
+            if len(self._buffer) < 3:
+                return
 
-        if len(self._buffer) < expected:
-            return
+            func = self._buffer[1]
+            if func == MODBUS_READ_HOLDING:
+                if self._read_bytecount is not None and self._buffer[2] != self._read_bytecount:
+                    self.logger.warning("daly2 unexpected read length %d (want %d): %s",
+                                        self._buffer[2], self._read_bytecount, self._buffer.hex())
+                    del self._buffer[0]
+                    continue
+                # [addr][0x03][bytecount][...data...][crc_lo][crc_hi]
+                expected = 3 + self._buffer[2] + 2
+            elif func == MODBUS_WRITE_SINGLE:
+                # echo: [addr][0x06][reg_hi][reg_lo][val_hi][val_lo][crc_lo][crc_hi]
+                expected = 8
+            elif func & 0x80:
+                # exception: [addr][func|0x80][exc_code][crc_lo][crc_hi]
+                expected = 5
+            else:
+                self.logger.warning("daly2 unexpected func 0x%02x: %s", func, self._buffer.hex())
+                del self._buffer[0]
+                continue
 
-        frame = bytes(self._buffer[:expected])
-        self._buffer.clear()
+            if len(self._buffer) < expected:
+                return
 
-        func = frame[1]
-        crc_calc = _modbus_crc16(frame[:-2])
-        crc_recv = frame[-2] | (frame[-1] << 8)
-        if crc_calc != crc_recv:
-            self.logger.warning("daly2 crc fail (calc %04x != recv %04x): %s",
-                                crc_calc, crc_recv, frame.hex())
-            return
+            frame = bytes(self._buffer[:expected])
+            crc_calc = _modbus_crc16(frame[:-2])
+            crc_recv = frame[-2] | (frame[-1] << 8)
+            if crc_calc != crc_recv:
+                self.logger.warning("daly2 crc fail (calc %04x != recv %04x): %s",
+                                    crc_calc, crc_recv, frame.hex())
+                del self._buffer[0]
+                continue
 
-        self._fetch_futures.set_result(func, frame)
+            del self._buffer[:expected]
+
+            # An exception reply carries func|0x80 as its command byte but answers
+            # the request's function: deliver it under the request key, otherwise
+            # the waiter on the plain function never sees it.
+            self._fetch_futures.set_result(func & 0x7F if func & 0x80 else func, frame)
 
     async def connect(self, **kwargs):
         await super().connect(**kwargs)
@@ -143,6 +168,8 @@ class Daly2Bt(BtBms):
             await enumerate_services(self.client, self.logger)
             raise Exception("Notify characteristic (rx) not found")
 
+        self._first_reply_pending = True
+
     async def disconnect(self):
         if self.UUID_RX:
             await self.client.stop_notify(self.UUID_RX)
@@ -151,17 +178,30 @@ class Daly2Bt(BtBms):
 
     async def _q(self, request: bytes, timeout=None):
         func = request[1]
-        self._buffer.clear()
-        with self._fetch_futures.acquire(func):
-            self.logger.debug("daly2 send: %s", request.hex())
-            await self.client.write_gatt_char(self.UUID_TX, request, response=False)
-            try:
-                return await self._fetch_futures.wait_for(func, timeout or self.TIMEOUT)
-            except asyncio.TimeoutError:
-                # J/T/A/U/W-series modules use the same fff0 GATT layout but only
-                # answer classic A5 frames, so they ignore every Modbus request (#416)
-                raise asyncio.TimeoutError("no Modbus reply to func 0x%02x; if this BMS never answers, "
-                                         "it may speak the classic protocol: try type: daly" % func)
+        if func == MODBUS_READ_HOLDING:
+            self._read_bytecount = int.from_bytes(request[4:6], 'big') * 2
+        attempts = 2 if self._first_reply_pending else 1
+        for attempt in range(attempts):
+            self._buffer.clear()
+            with self._fetch_futures.acquire(func):
+                self.logger.debug("daly2 send%s: %s", " (retry)" if attempt else "", request.hex())
+                await self.client.write_gatt_char(self.UUID_TX, request, response=False)
+                try:
+                    frame = await self._fetch_futures.wait_for(func, timeout or self.TIMEOUT)
+                except asyncio.TimeoutError:
+                    if attempt + 1 < attempts:
+                        continue
+                    # the module is not answering at all; don't retry every
+                    # cycle from now on
+                    self._first_reply_pending = False
+                    # J/T/A/U/W-series modules use the same fff0 GATT layout but only
+                    # answer classic A5 frames, so they ignore every Modbus request (#416)
+                    raise asyncio.TimeoutError("no Modbus reply to func 0x%02x; if this BMS never answers, "
+                                             "it may speak the classic protocol: try type: daly" % func)
+                self._first_reply_pending = False
+                if frame[1] & 0x80:
+                    raise IOError("Modbus exception 0x%02x for func 0x%02x" % (frame[2], func))
+                return frame
 
     async def fetch(self) -> BmsSample:
         # binary reading
@@ -236,8 +276,9 @@ class Daly2Bt(BtBms):
         req = _write_request(reg, 1 if state else 0)
         self.logger.info("daly2 set %s mosfet -> %s: %s", switch, state, req.hex())
         # A correct write echoes the request frame (func 0x06). If the register
-        # is wrong the BMS stays silent, so don't let the missing echo turn into
-        # a fatal 8s-blocking traceback in the mqtt action queue.
+        # is wrong the BMS stays silent or answers with an exception frame, so
+        # don't let either turn into a fatal blocking traceback in the mqtt
+        # action queue.
         try:
             echo = await self._q(req, timeout=self.SET_SWITCH_TIMEOUT)
             self.logger.info("daly2 %s mosfet write echoed: %s", switch, echo.hex())
@@ -249,5 +290,10 @@ class Daly2Bt(BtBms):
             self.logger.warning(
                 "daly2 %s mosfet write to reg 0x%04x got no echo - register may be "
                 "wrong for this firmware or the command was rejected", switch, reg)
+            return False
+        except IOError as e:
+            self.logger.warning("daly2 %s mosfet write to reg 0x%04x was rejected: %s",
+                                switch, reg, e)
+            return False
 
 

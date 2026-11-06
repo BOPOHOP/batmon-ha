@@ -79,10 +79,17 @@ This is genuinely different from the JK BLE protocol (`55 AA EB 90 …` fixed
 
 | Fixture | Type | Source |
 |---|---|---|
-| `STATUS_DSG_ON` | inline | `bmslib/models/daly.py:242` — bytearray comment in `_fetch_status`. Real cmd 0x93 response captured by batmon-ha author with discharging MOSFET on. |
-| `STATUS_DSG_OFF` | inline | `bmslib/models/daly.py:237` — same `_fetch_status` comment block, "dsgOFF" case. Note: the raw MOS bits don't track the real switch state (a known Daly quirk; documented in the source comment). |
-| `STATES_8CELL` | inline | `bmslib/models/daly.py:285` — comment in `fetch_states`. cmd 0x94 response for an 8-cell, 1-temp pack. |
-| `SOC_SYNTHETIC_…` | synthesized | Built from the cmd 0x90 layout (`>h h h h`: voltage×10, x_voltage×10, current+30000×10, soc×10) per the [Daly UART/485 Communications Protocol v1.2 PDF](https://github.com/maland16/daly-bms-uart/blob/main/docs/Daly%20UART_485%20Communications%20Protocol%20V1.2.pdf). Cross-checked against [`dreadnought/python-daly-bms`](https://github.com/dreadnought/python-daly-bms). |
+| `STATUS_DSG_ON` | inline | `bmslib/models/daly.py:400` — bytearray comment in `_fetch_status`. Real cmd 0x93 response captured by batmon-ha author with discharging MOSFET on. |
+| `STATUS_DSG_OFF` | inline | `bmslib/models/daly.py:395` — same `_fetch_status` comment block, "dsgOFF" case. Note: the raw MOS bits don't track the real switch state (a known Daly quirk; documented in the source comment). |
+| `STATES_8CELL` | inline | `bmslib/models/daly.py:436` — comment in `fetch_states`. cmd 0x94 response for an 8-cell, 1-temp pack. |
+| `STATES_4CELL_AA_FLAGS` | captured payload | DALY R24TK via [#429](https://github.com/fl4p/batmon-ha/issues/429), payload of the UART reply below. Its flags byte is the reflected 0xAA *wired-request* fill (the BLE path fills 0x00); the four set bits 1,3,5,7 decode as DI2, DI4, DO2, DO4. Bit order is LSB-first, matching [`maland16/daly-bms-uart`](https://github.com/maland16/daly-bms-uart) `getStatusInfo()` (`dIO[i] = bitRead(payload[4], i)`); batmon's DI1-4 / DO1-4 names for bits 0-3 / 4-7 are its own. The old `bin()`/`int()` loop raised on 0xAA; the shift/mask decode is sign-invariant. |
+| `STATES_8CELL_HIGH_CYCLES` | synthesized | cmd 0x94 layout. Pins the cycle counter as unsigned: raw 0x8000 is 32768, which a signed `h` decoded as −32768. |
+| `STATES_HIGH_COUNTS` | synthesized | cmd 0x94 layout. Pins the cell/temp counts as unsigned: raw 0x80/0x81 are 128/129, which signed `b` decoded as −128/−127. |
+| `TEMPS_ONE_ABOVE_127` | synthesized | cmd 0x96 layout (`>b 7B`: probe index, then temp+40). Pins the value bytes as unsigned: raw 0xAA is 130 °C, which a signed `b` decoded as −126 °C. |
+| `VOLTAGES_3CELL_HIGH` | synthesized | cmd 0x95 layout (`>b 3H x`). Pins cell voltages as unsigned mV: raw 0x8000 is 32768 mV, which a signed `h` decoded as −32768. Also covers the single-response wrap for packs of three or fewer cells. |
+| `VOLTAGES_4CELL` | synthesized | cmd 0x95 layout, two back-to-back frames as a 4-cell pack gets them; covers the multi-response list path. |
+| `SOC_SYNTHETIC_…` | synthesized | Built from the cmd 0x90 layout (`>h h H h`: voltage×10, x_voltage×10, current+30000×10 as unsigned, soc×10) per the [Daly UART/485 Communications Protocol v1.2 PDF](https://github.com/maland16/daly-bms-uart/blob/main/docs/Daly%20UART_485%20Communications%20Protocol%20V1.2.pdf). Cross-checked against [`dreadnought/python-daly-bms`](https://github.com/dreadnought/python-daly-bms). |
+| `SOC_HIGH_CURRENT` | synthesized | cmd 0x90 layout. Pins the current word as unsigned: current+30000 = 0x80E8 is +300.0 A, which a signed `h` decoded as roughly −6254 A. |
 
 ---
 
@@ -90,14 +97,18 @@ This is genuinely different from the JK BLE protocol (`55 AA EB 90 …` fixed
 
 | Fixture | Type | Source |
 |---|---|---|
-| `SOC_26V4`, `STATUS_CHARGING`, `STATES_8S` | wrapped-inline | Same 8-byte payloads as the BLE fixtures (`STATUS_DSG_ON`, `STATES_8CELL`, `SOC_SYNTHETIC_…`), wrapped in the full 13-byte ``A5 01 cmd 08 <payload> <crc>`` envelope the BMS sends on the wire. The wire format is identical between BLE and UART. |
-| `REQUEST_FRAMES` | derived | The four 13-byte read commands (`0x90`, `0x93`, `0x94`, `0x95`) produced by ``daly_command_message(cmd, address=4)``. |
+| `SOC_26V4`, `SOC_HIGH_CURRENT`, `STATUS_CHARGING`, `STATES_8S` | wrapped-inline | Same 8-byte payloads as the BLE fixtures (`STATUS_DSG_ON`, `STATES_8CELL`, `SOC_SYNTHETIC_…`, `SOC_HIGH_CURRENT`), wrapped in the full 13-byte ``A5 01 cmd 08 <payload> <crc>`` envelope the BMS sends on the wire. The wire format is identical between BLE and UART. |
+| `STATES_4S_AA_FLAGS` | captured frame | The [#429](https://github.com/fl4p/batmon-ha/issues/429) DALY R24TK cmd 0x94 reply in its `A5 01 …` envelope; `STATES_4CELL_AA_FLAGS` is this frame's payload, CRC recomputed independently (`0x33`). |
+| `REQUEST_FRAMES` | derived | The four 13-byte read commands (`0x90`, `0x93`, `0x94`, `0x95`) produced by ``daly_uart.build_command(cmd)`` for board 1, i.e. ``daly_command_message(cmd, addr_byte=0x40, fill=0xAA)``. |
+| `REQUEST_FRAMES_ZERO_FILL` | derived | The same read commands with the pre-2.15 0x00 payload fill, kept to distinguish the two encodings ([#398](https://github.com/fl4p/batmon-ha/issues/398)). |
 
-The decisive on-wire difference between BLE and UART is the host-address
-byte at frame position 1 — **4** for USB / RS485, **8** for BLE. Verified
+Requests differ from BLE in the host-address field at frame position 1 — host
+nibble **4** for USB / RS485 (wire byte `0x40`..`0x4F`, boards 1..16) or
+**8** for BLE (byte `0x80`) — and in the fill of the 8 don't-care payload
+bytes (**0xAA** wired, **0x00** BLE). Responses are byte-identical. Verified
 in four independent references:
 - [`maland16/daly-bms-uart`](https://github.com/maland16/daly-bms-uart) — Arduino library; init sets ``my_txBuffer[1] = 0x40`` (host=4) and runs the link at ``9600 8N1`` (this is also where the baud rate comes from — `DalyUart.BAUDRATE = 9600`).
-- [`dreadnought/python-daly-bms`](https://github.com/dreadnought/python-daly-bms/blob/main/dalybms/daly_bms.py) (``"4 for RS485, 8 for UART/Bluetooth"``)
+- [`dreadnought/python-daly-bms`](https://github.com/dreadnought/python-daly-bms/blob/main/dalybms/daly_bms.py) (``"4 for RS485, 8 for UART/Bluetooth"``; batmon's wired path sends nibble 4 / `0x40` on TTL-UART too, per maland16)
 - [`syssi/esphome-daly-bms`](https://github.com/syssi/esphome-daly-bms) (README + component header)
 - ``bmslib/models/daly.py`` inline comment (``# 4 = USB, 8 = Bluetooth``)
 
@@ -125,7 +136,7 @@ request-builder address byte and the BLE connect/notify glue change.
 
 | Fixture | Type | Source |
 |---|---|---|
-| `STATUS_*`, `CELLS_*`, `LIMITS_*`, `TRUNCATED_*`, `REQ_*` | harvested | [`KrzysztofHajdamowicz/felicity-battery-modbus` — `captures/2026-10-10-rs485-bus.log`](https://github.com/KrzysztofHajdamowicz/felicity-battery-modbus/blob/main/captures/2026-10-10-rs485-bus.log) (MIT). Live RS485 traffic of three FLB48314TG1 packs at DIP addresses 1-3, 9600 8N1; each fixture carries the capture timestamp of its frame. `STATUS_1_DOC_EXAMPLE` is the 13:03:34 frame that the project's `docs/protocol.md` §5 works through by hand (53.41 V, −1.9 A, −101 W, SOC 95 %, 350.0 Ah, 28.1 °C), which is the test's independent ground truth. The two `TRUNCATED_*` frames are the reporter's USB-RS485 adapter losing the CRC high byte and the slave address. |
+| `STATUS_*`, `CELLS_*`, `LIMITS_*`, `TRUNCATED_*`, `REQ_*` | harvested | [`KrzysztofHajdamowicz/felicity-battery-modbus` — `captures/2026-10-10-rs485-bus.log`](https://github.com/KrzysztofHajdamowicz/felicity-battery-modbus/blob/main/captures/2026-10-10-rs485-bus.log) (MIT). Live RS485 traffic of three FLB48314TG1 packs at bus addresses 1-3 (auto-assigned; the model has no DIP switches), 9600 8N1; each fixture carries the capture timestamp of its frame. `STATUS_1_DOC_EXAMPLE` is the 13:03:34 frame that the project's `docs/protocol.md` §5 works through by hand (53.41 V, −1.9 A, −101 W, SOC 95 %, 350.0 Ah, 28.1 °C), which is the test's independent ground truth. The two `TRUNCATED_*` frames are the reporter's USB-RS485 adapter losing the CRC high byte and the slave address. |
 | version block, limits/status blocks with distinct words per register, the echo / noise / foreign-frame / exception cases in `test_felicity_uart_decode.py` | synthesized | None of these are in the capture. The version block (registers 1-6) was never polled on the wire; `docs/protocol.md` reports it answered by firmware 1.1 via `felicityd`, and the fixture follows the documented layout. The all-distinct-register blocks exist because the real frames repeat values (480 in both registers 113 and 114, `0x0001_0001` for both version words, 3012 across the probes), which hides an off-by-one register. The alarm registers 55-60 are not decoded at all, so there is no alarm fixture — see the note in `bmslib/models/felicity_uart.py`. |
 
 All 101 CRC-valid responses in that capture were replayed through
@@ -158,7 +169,8 @@ Protocol cross-references:
 
 | Fixture | Type | Source |
 |---|---|---|
-| `REDODO_8S` | harvested | [`patman15/aiobmsble` — `tests/bms/test_redodo_bms.py`](https://github.com/patman15/aiobmsble/blob/main/tests/bms/test_redodo_bms.py) `MockRedodoBleakClient._RESP`. 101-byte single-frame status response for an 8S Redodo pack. The LiTime, Redodo, and several other Chinese 12V/24V LFP shunt brands share this exact protocol. Apache-2.0. |
+| `REDODO_8S` | harvested | [`patman15/aiobmsble` — `tests/bms/test_redodo_bms.py`](https://github.com/patman15/aiobmsble/blob/main/tests/bms/test_redodo_bms.py) `MockRedodoBleakClient._RESP`. 105-byte status frame (length byte 101) for an 8S Redodo pack. The LiTime, Redodo, and several other Chinese 12V/24V LFP shunt brands share this exact protocol. Apache-2.0. |
+| `OVERFULL_COUNTER`, `GARBLED_SOC` | synthesized | `REDODO_8S` with bytes 62:66 (counters) and 90:92 (SoC) patched to the values from [#428](https://github.com/fl4p/batmon-ha/issues/428) — remaining charge 263.25 Ah over a 241.5 Ah capacity while the BMS SoC says 99 % — and to a garbled SoC field (65535). The trailing checksum byte is the untouched REDODO value, so it does not match the patched payload; `litime.py` validates no checksum. |
 
 Protocol cross-references:
 [`calledit/LiTime_BMS_bluetooth`](https://github.com/calledit/LiTime_BMS_bluetooth)

@@ -1,6 +1,30 @@
 ## [unreleased]
 
+* Fix (`ble_stack: esphome`): one unreachable proxy held start-up forever, so nothing was polled. Start-up now waits at most 10 s; an offline proxy keeps reconnecting in the background (#430).
+
+## [2.28]
+
+* Fix: when the MQTT watchdog exited the add-on, energy counters, Qmax/SoH and cell-resistance state could go unsaved, because the main loop rarely reached its final store before the forced exit (#391).
+
+* Doc: to share one Bluetooth proxy between Home Assistant and the add-on, flash nimble-ble-proxy ≥ 0.2.0, which serves several API clients and frees a restarted client's BMS links (#391).
+
+* Fix (`litime`): publish the BMS's own SoC; deriving it from the charge counter, which can run past `capacity`, gave 109 % where the app shows 99 %. An implausible field falls back to the derivation (#428).
+* Fix (`daly`): the `0x94` DI/DO flags byte was unpacked signed, so a bit at `0x80` or above (the `0xAA` wired-request fill is reflected into it) raised and left the BMS unavailable (#429, thanks @Vittaly76).
+* Fix (`daly`): temperatures above 87 °C decoded negative because probe values were unpacked signed; they are unsigned bytes offset by 40 (#429).
+* Fix (`daly`): the cycle counter, cell/temp counts and cell voltages are decoded unsigned, so a pack past 32767 cycles no longer reports a negative count (#429).
+* Fix (`daly`): the `0x90` current word is unsigned again, so a discharge above 276.7 A no longer reads as roughly −6000 A; ≤3-cell packs no longer crash on the voltage frame (#429).
+* Fix (`daly2`): a module that drops the first request after connecting lost that sampling cycle to an 8 s timeout; the request is now re-sent once (#427).
+* Fix (`daly2`): a Modbus exception reply (func|0x80) timed out instead of reporting the exception code.
+* Fix (`daly2`): a switch write the BMS rejected no longer echoes the requested state to Home Assistant; the next sample publishes the register state.
+* Fix (`soh_estimator`): a set SOC or JK capacity write from batmon moved the charge counter unseen, so a restart soon after could keep a Qmax segment with charge missing. Saved Qmax history restarts once.
+
+## [2.27]
+
+* Fix (JK settings): on firmware without Cell RCV/RFV (HW 11A, FW 11.54), read as 0 V, every SOC 100% write was rejected. Writes to RCV/RFV themselves are now refused instead of locking all writes (#426).
+* `impedance_estimator`: Cell Resistance is now normalised to 25 °C (−2.5 %/°C) by a BMS probe or the warmed-up `pack_temp_estimator`; MOSFET-only packs get none. Saved windows are discarded once.
 * Fix: the web GUI still started under Home Assistant in 2.26 (unreachable, as its ingress panel was removed), because the add-on's default options set `gui: true` (#425).
+* Fix (`jk`): disconnecting an already dropped link crashed the add-on's shutdown and skipped the base disconnect and saving the final state (#391).
+* Doc: an ESPHome proxy serves BLE to one API client only; one shared with Home Assistant silently stops all BMS on it after an HA reconnect (#391).
 
 ## [2.26]
 

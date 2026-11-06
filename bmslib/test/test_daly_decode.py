@@ -7,6 +7,7 @@ monkey-patching ``_q``.
 """
 
 import asyncio
+import math
 
 import pytest
 
@@ -52,6 +53,37 @@ def test_daly_states(fx):
     # states is a sparse dict of "true" pins; check just the ones we expect
     for pin, val in exp["states"].items():
         assert data["states"].get(pin) is val
+
+
+@pytest.mark.parametrize("fx", daly_fixtures.ALL_VOLTAGES, ids=lambda fx: fx["name"])
+def test_daly_voltages(fx):
+    """Cell voltages are unsigned mV; 0x8000 must decode as 32768, not -32768."""
+    bms = _make_daly()
+
+    calls = []
+
+    async def fake_q(cmd, num_responses=1):
+        calls.append((cmd, num_responses))
+        return fx["raw"]
+
+    bms._q = fake_q
+    expected = fx["expected"]["voltages"]
+    voltages = asyncio.run(bms.fetch_voltages(num_cells=len(expected)))
+    assert voltages == expected
+    assert calls == [(0x95, math.ceil(len(expected) / 3))]
+
+
+@pytest.mark.parametrize("fx", daly_fixtures.ALL_TEMPERATURES, ids=lambda fx: fx["name"])
+def test_daly_temperatures(fx):
+    """Probe values are unsigned byte temp+40; >127 raw must not wrap negative."""
+    bms = _make_daly()
+
+    async def fake_q(cmd, num_responses=1):
+        return fx["raw"]
+
+    bms._q = fake_q
+    temperatures = asyncio.run(bms.fetch_temperatures(num_sensors=2))
+    assert temperatures == fx["expected"]["temperatures"]
 
 
 @pytest.mark.parametrize("fx", daly_fixtures.ALL_SOC, ids=lambda fx: fx["name"])

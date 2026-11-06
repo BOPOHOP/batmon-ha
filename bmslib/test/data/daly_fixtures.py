@@ -8,7 +8,7 @@ fixtures below capture that 8-byte payload, which is what ``_q`` returns
 directly.
 """
 
-# Status (cmd 0x93) — from in-source comments in bmslib/models/daly.py:237-245.
+# Status (cmd 0x93) — from in-source comments in bmslib/models/daly.py:394-403.
 # The C-style format is ">b ? ? B l": mode, charging_mosfet, discharging_mosfet,
 # unused_byte, capacity_in_mAh (signed 32-bit BE).
 STATUS_DSG_ON = dict(
@@ -38,11 +38,11 @@ STATUS_DSG_OFF = dict(
 ALL_STATUS = [STATUS_DSG_ON, STATUS_DSG_OFF]
 
 
-# States (cmd 0x94) — from in-source comments at daly.py:285.
-# Format ">b b ? ? b h x": num_cells, num_temps, charging, discharging,
+# States (cmd 0x94) — from in-source comments at daly.py:435-441.
+# Format ">B B ? ? B H x": num_cells, num_temps, charging, discharging,
 # state_bits, num_cycles, pad.
 STATES_8CELL = dict(
-    name="daly_states_8cell_2temp",
+    name="daly_states_8cell_1temp",
     cmd=0x94,
     raw=b"\x08\x01\x00\x00\x02\x00\x35\xdc",
     expected=dict(
@@ -55,14 +55,64 @@ STATES_8CELL = dict(
     ),
 )
 
-ALL_STATES = [STATES_8CELL]
+STATES_4CELL_AA_FLAGS = dict(
+    name="daly_states_4cell_aa_flags",
+    cmd=0x94,
+    # Real frame from a DALY R24TK (#429): the 0xAA wired-request fill is
+    # reflected into the flags byte, so it arrives as 0xAA instead of 0x00.
+    # The old bin()/int() decode raised on it; shift/mask is sign-invariant.
+    raw=b"\x04\x02\x00\x00\xaa\x00\x01\x40",
+    expected=dict(
+        num_cells=4,
+        num_temps=2,
+        charging=False,
+        discharging=False,
+        num_cycles=1,
+        states={"DI1": False, "DI2": True, "DI3": False, "DI4": True,
+                "DO1": False, "DO2": True, "DO3": False, "DO4": True},
+    ),
+)
+
+STATES_8CELL_HIGH_CYCLES = dict(
+    name="daly_states_8cell_high_cycles",
+    cmd=0x94,
+    # Raw u16 BE 0x8000 = 32768; a signed 'h' would decode it as -32768.
+    raw=b"\x08\x01\x00\x00\x00\x80\x00\x00",
+    expected=dict(
+        num_cells=8,
+        num_temps=1,
+        charging=False,
+        discharging=False,
+        num_cycles=32768,
+        states={},
+    ),
+)
+
+STATES_HIGH_COUNTS = dict(
+    name="daly_states_high_counts",
+    cmd=0x94,
+    # Raw 0x80/0x81 for cells/temps; signed 'b' would decode -128/-127.
+    raw=b"\x80\x81\x00\x00\x00\x00\x00\x00",
+    expected=dict(
+        num_cells=128,
+        num_temps=129,
+        charging=False,
+        discharging=False,
+        num_cycles=0,
+        states={},
+    ),
+)
+
+ALL_STATES = [STATES_8CELL, STATES_4CELL_AA_FLAGS, STATES_8CELL_HIGH_CYCLES,
+              STATES_HIGH_COUNTS]
 
 
-# SOC (cmd 0x90) — synthesized per protocol doc (4× signed BE 16-bit fields:
-# voltage*10, x_voltage*10, current+30000 (centred *10), soc*10).
+# SOC (cmd 0x90) — synthesized per protocol doc (BE 16-bit fields:
+# voltage*10 signed, x_voltage*10 signed, current+30000 (centred, unsigned)
+# *10, soc*10 signed).
 # Source: agent web-search round-trip-verified against dreadnought/python-daly-bms.
-SOC_SYNTHETIC_265V_5A = dict(
-    name="daly_soc_synth_26v5_neg5a_78p5",
+SOC_SYNTHETIC_26V4_5A = dict(
+    name="daly_soc_synth_26v4_pos5a_78p5",
     cmd=0x90,
     # 264 → 26.4V; 0 unused; 30050 → +5.0A; 785 → 78.5% SOC
     raw=b"\x01\x08\x00\x00\x75\x62\x03\x11",
@@ -73,4 +123,49 @@ SOC_SYNTHETIC_265V_5A = dict(
     ),
 )
 
-ALL_SOC = [SOC_SYNTHETIC_265V_5A]
+# Cell voltages (cmd 0x95) — format ">b 3H x": frame index, three cell mV.
+# Voltage bytes are unsigned; raw 0x8000 is 32768 mV rather than -32768.
+VOLTAGES_3CELL_HIGH = dict(
+    name="daly_voltages_3cell_high",
+    cmd=0x95,
+    raw=b"\x01\x0c\xe4\x0d\x16\x80\x00\x00",
+    expected=dict(voltages=[3300, 3350, 32768]),
+)
+
+# Two frames as a 4-cell pack gets them (one response per three cells), for the
+# num_resp > 1 list path.
+VOLTAGES_4CELL = dict(
+    name="daly_voltages_4cell",
+    cmd=0x95,
+    raw=[b"\x01\x0c\xe4\x0d\x16\x0d\x0c\x00", b"\x02\x0d\x1b\x00\x00\x00\x00\x00"],
+    expected=dict(voltages=[3300, 3350, 3340, 3355]),
+)
+
+ALL_VOLTAGES = [VOLTAGES_3CELL_HIGH, VOLTAGES_4CELL]
+
+SOC_HIGH_CURRENT = dict(
+    name="daly_soc_53v2_pos300a_50",
+    cmd=0x90,
+    # voltage*10 = 532 (0x0214); current+30000 = 33000 (0x80E8); soc*10 = 500
+    raw=b"\x02\x14\x00\x00\x80\xe8\x01\xf4",
+    expected=dict(
+        voltage=53.2,
+        current=300.0,
+        soc=50.0,
+    ),
+)
+
+ALL_SOC = [SOC_SYNTHETIC_26V4_5A, SOC_HIGH_CURRENT]
+
+
+# Temperatures (cmd 0x96) — format ">b 7B": probe index, then temp+40 per probe.
+# The value bytes are unsigned: a probe above 87 °C (raw > 127) must not wrap
+# negative.
+TEMPS_ONE_ABOVE_127 = dict(
+    name="daly_temps_neg16_130",
+    cmd=0x96,
+    raw=b"\x01\x18\xaa\xff\xff\xff\xff\x00",
+    expected=dict(temperatures=[-16, 130]),
+)
+
+ALL_TEMPERATURES = [TEMPS_ONE_ABOVE_127]

@@ -79,19 +79,23 @@ async def fetch_loop(fn, period, max_errors, max_backoff=60):
         await fn.bms.disconnect()
 
 
+_store_lock = threading.Lock()  # the watchdog thread and the main shutdown path may both store
+
+
 def store_states(samplers: list[BmsSampler], final=False):
-    meter_states = {s.bms.name: s.get_meter_state() for s in samplers}
-    from bmslib.store import store_meter_states
-    store_meter_states(meter_states)
-    for s in samplers:
-        try:
-            s.store_impedance_state(final=final)
-        except Exception as e:
-            logger.error('%s: error storing cell resistance state: %s', s.bms.name, e)
-        try:
-            s.store_qmax_state(final=final)
-        except Exception as e:
-            logger.error('%s: error storing Qmax/SoH state: %s', s.bms.name, e)
+    with _store_lock:
+        meter_states = {s.bms.name: s.get_meter_state() for s in samplers}
+        from bmslib.store import store_meter_states
+        store_meter_states(meter_states)
+        for s in samplers:
+            try:
+                s.store_impedance_state(final=final)
+            except Exception as e:
+                logger.error('%s: error storing cell resistance state: %s', s.bms.name, e)
+            try:
+                s.store_qmax_state(final=final)
+            except Exception as e:
+                logger.error('%s: error storing Qmax/SoH state: %s', s.bms.name, e)
 
 
 def _runtime_kind():
@@ -115,6 +119,13 @@ def bg_checks(sampler_list, timeout, t_start):
             else:
                 logger.error("MQTT never published a message after %.0fs, exit", timeout)
             shutdown = True
+            # background_thread kills the process 10 s from now; the main loop may not reach
+            # its own final store in time (it sleeps through backoff + period first, #391).
+            # Store here: both background_loop and background_thread call this.
+            try:
+                store_states(sampler_list, final=True)
+            except Exception as e:
+                logger.error('Error storing final states: %s', e)
             return False
 
     global t_last_store
@@ -642,7 +653,11 @@ async def main():
         await fetch_loop(fn, period=sample_period, max_errors=max_errors)
         for t in tasks:
             if isinstance(t, BmsSampler):
-                await t.bms.disconnect()
+                try:
+                    await t.bms.disconnect()
+                except Exception as e:
+                    # an already dropped link must not skip store_states(final=True) below (#391)
+                    logger.info('Disconnecting %s failed: %s', t.bms, e)
 
     logger.debug('All fetch loops ended. shutdown is already %s', shutdown)
 

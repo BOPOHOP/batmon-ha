@@ -251,8 +251,12 @@ Supported types (baud rate in parentheses):
 * `felicity_uart` (9600) — Felicity Solar 48 V packs (FLB48314TG1, FLB48100,
   LPBF48/LPBA48) on the RS485 pins 5/6 of their RJ45 port: the Voltronic "LIB"
   protocol, Modbus RTU function 0x03 with a 16-bit register count in place of
-  Modbus's byte count. `felicity_uart:<addr>` for the DIP-switch address
-  (default 1); several packs share one adapter, one device entry each. An
+  Modbus's byte count. `felicity_uart:<addr>` for the bus address
+  (default 1); several packs share one adapter, one device entry each. The
+  FLB48314TG1 has no DIP switches — the packs auto-assign consecutive addresses,
+  so start at 1 and add entries until one stops answering. The protocol carries
+  no pack serial, so a reassignment cannot be detected: an `alias` would follow
+  whichever pack holds that address. An
   alternative to the BLE `felicity` for setups troubled by bonding or adapter
   scan contention ([#415](https://github.com/fl4p/batmon-ha/issues/415)); it has
   not been run on hardware yet, so no claim that it is the more reliable path.
@@ -387,10 +391,18 @@ Batmon can talk to your BMS through one of four Bluetooth backends. Pick one wit
   (typically a cheap ESP32 flashed with the upstream
   [bluetooth-proxies](https://github.com/esphome/bluetooth-proxies) firmware). The add-on
   doesn't touch any local Bluetooth adapter — you can extend BLE reach to wherever your BMSes
-  physically live (other rooms, outdoors) just by powering an ESP32 there. Coexists with HA's
-  Bluetooth integration; each proxy can host multiple clients but BLE connection slots are shared
-  (default 3 per proxy, see [esphome_proxy/README.md](bmslib/esphome_proxy/bootstrap.py) for
-  notes on bumping). Configure the proxies under the `bluetooth_proxies:` add-on option:
+  physically live (other rooms, outdoors) just by powering an ESP32 there. **An ESPHome proxy serves
+  BLE to one client only**: its advertisements and the data of every BLE connection go to whichever
+  API client subscribed last (ESPHome ≥ 2026.7; before that, the first). If Home Assistant also uses
+  the proxy, whichever of HA and the add-on reconnects last takes it over, and the other silently gets
+  nothing: an HA restart stops every BMS on the proxy until the add-on reconnects, and the add-on
+  winning cuts off HA's own BLE devices there. Use proxies dedicated to the add-on: remove them from
+  HA's ESPHome integration or leave them out of HA. To share one proxy between HA and the add-on, flash
+  [nimble-ble-proxy](https://fl4p.github.io/nimble-ble-proxy-esphome/) ≥ 0.2.0 instead (browser
+  flasher): it serves up to 4 API clients at once, and each BLE link belongs to the client that opened
+  it, so an add-on restart frees its BMS links. Each proxy has 3 BLE connection slots by default (see
+  [esphome_proxy/README.md](bmslib/esphome_proxy/README.md)). Configure the proxies under the
+  `bluetooth_proxies:` add-on option:
 
   ```yaml
   ble_stack: esphome
